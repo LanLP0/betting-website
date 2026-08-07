@@ -22,6 +22,10 @@ flowchart LR
     API --> EV[Events<br>GET events, realtime metrics, odds]
     API --> MM[Management & Metrics]
 
+    %% External Services
+    WP <--> PG[Payment Gateway<br>Withdraw/Deposit]
+    EV <--> OS[Odds Supplier<br>Odds feed]
+
     %% Async Message Bus Connections
     EB[Event Bus<br>RabbitMQ]
     EB <--> US
@@ -37,6 +41,12 @@ flowchart LR
     DB[(Datastore<br>PostgreSQL)]
     CACHE[(Cache<br>Redis)]
 
+    %% Notification Service
+    EB <--> NS[Notification Service]
+    NS -->|publish notification| NWWS[Notification Worker (websocket)]
+    NS <--|client subsribe to notification, e.g. specific odds| NWWS
+    CACHE -->|direct odds read from Redis| NWWS
+
     US <--> DB
     WP <--> DB
     BET <--> DB
@@ -47,11 +57,7 @@ flowchart LR
     EV <--> CACHE
 ```
 
-For demonstration purposes, we only use a
-single PostgreSQL with different schemas
-and Redis instance. But services cannot cross-
-read each other's data (DB isolation).
-We also use single instance of other services.
+For demonstration purposes, we only use a single PostgreSQL with different schemas and a Redis instance. But services cannot cross-read each other's data (DB isolation).
 
 ---
 
@@ -69,6 +75,8 @@ Every service is implemented as an independent Rust binary utilizing the high-pe
 - **Wallet & Payments:** Coordinates the strict financial ledger. Responsible for balancing deposits, withdrawals, and locking funds. It interacts solely with the database layer using explicit **pessimistic database locks** to prevent race conditions or double-spending (ACID compliance).
 - **Betting Service:** Orchestrates the lifecycle of a bet (Pending $\rightarrow$ Confirmed $\rightarrow$ Settled). It acts as a Saga coordinator or workflow controller using event state flags.
 - **Events Service:** Exposes fast read-only APIs for match data and current odds. It processes inbound mock odds feeds and constantly pushes updates out via WebSockets.
+- **Notification Service:** Communication with user frontend via WebSocket: user subscribe to events, worker push notifications.
+- **Management & Metrics:** Exposes APIs for management and metrics.
 
 ### 2.3 Event Bus & Messaging Layer
 
@@ -86,6 +94,11 @@ Every service is implemented as an independent Rust binary utilizing the high-pe
 - **The Concept:** For a high-throughput betting site, a common production trick is to configure Nginx (often using OpenResty or Kong) to read directly from Redis for public, unauthenticated routes.
 
 - **The Result:** When 10,000 users refresh the odds page, the request never even touches your Rust Events service. Nginx serves the JSON straight from Redis memory.
+
+### 2.6 Mock External Service
+
+- Payment Gateway: Withdraw/Deposit. Mock with delays and random failures. (use their own portal and callback url)
+- Odds Supplier
 
 ---
 
