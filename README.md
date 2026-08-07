@@ -18,3 +18,4 @@ For a full specification of this project, see [specs.md](specs.md).
 - [ ] Server-wide request tracing
 - [ ] Zero trust: also verify internal requests
 - [ ] Add unit and integration tests
+- [ ] There are many slient failures within the project --> reinforce every single route

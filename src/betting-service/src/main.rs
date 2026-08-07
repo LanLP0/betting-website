@@ -92,6 +92,7 @@ async fn place_bet(
     data: web::Data<AppState>,
     body: web::Json<PlaceBetReq>,
 ) -> impl Responder {
+    // TODO check if event is still running
     let user_id_str = req.headers().get("X-User-ID").unwrap().to_str().unwrap();
     let user_id = Uuid::parse_str(user_id_str).unwrap();
 
@@ -171,6 +172,7 @@ async fn place_bet(
 }
 
 async fn cancel_bet(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
+    // TODO check if event is still running
     let bet_id = Uuid::parse_str(req.match_info().get("id").unwrap()).unwrap();
     let _ = sqlx::query!(
         "UPDATE bets_schema.bets SET status = 'CANCELLED' WHERE id = $1 AND status = 'PENDING'",
@@ -178,6 +180,8 @@ async fn cancel_bet(req: HttpRequest, data: web::Data<AppState>) -> impl Respond
     )
     .execute(&data.db)
     .await;
+    // TODO return status
+    // TODO publish bet.cancelled
     HttpResponse::Ok().finish()
 }
 
@@ -194,15 +198,13 @@ async fn handle_wallet_status(pool: &PgPool, rmq: &lapin::Channel, status: Walle
     let new_status = if status.status == "SUCCESS" {
         if current_status == "PENDING-WON" {
             let bet = sqlx::query!(
-                "SELECT id, user_id, amount, odds_at_placement FROM bets_schema.bets WHERE id = $1",
+                "SELECT id, user_id, amount, odds_at_placement, amount * odds_at_placement AS payout FROM bets_schema.bets WHERE id = $1",
                 status.bet_id
             )
             .fetch_one(pool)
             .await
             .unwrap();
-            let amount_f = bet.amount.to_f64().unwrap_or(0.0);
-            let odds_f = bet.odds_at_placement.to_f64().unwrap_or(1.0);
-            let payout = amount_f * odds_f;
+            let payout_f = bet.payout.unwrap().to_f64().unwrap();
             let _ = publish_event(
                 rmq,
                 "betting_topic",
@@ -210,7 +212,7 @@ async fn handle_wallet_status(pool: &PgPool, rmq: &lapin::Channel, status: Walle
                 BetWon {
                     bet_id: bet.id,
                     user_id: bet.user_id,
-                    payout_amount: payout,
+                    payout_amount: payout_f,
                 },
             )
             .await;
@@ -236,13 +238,15 @@ async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventS
     const BATCH_SIZE: i64 = 1000;
     let mut last_id = Uuid::nil();
 
-    // Settle Confirmed/Pending Bets in batches to prevent out-of-memory errors
     loop {
+        // 1. Fetch batch
         let bets = sqlx::query!(
-            "SELECT id, user_id, selection, amount, odds_at_placement, status \
-             FROM bets_schema.bets \
-             WHERE event_id = $1 AND (status = 'CONFIRMED' OR status = 'PENDING') AND id > $2 \
-             ORDER BY id LIMIT $3",
+            r#"
+            SELECT id, user_id, selection, amount, odds_at_placement, status
+            FROM bets_schema.bets
+            WHERE event_id = $1 AND status IN ('CONFIRMED', 'PENDING') AND id > $2
+            ORDER BY id LIMIT $3
+            "#,
             event.event_id,
             last_id,
             BATCH_SIZE
@@ -257,56 +261,88 @@ async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventS
 
         last_id = bets.last().unwrap().id;
 
-        for bet in bets {
-            if bet.status == "PENDING" {
-                // User has placed a bet but wallet service hadn't yet confirmed
-                let new_status = match bet.selection == event.winning_selection {
-                    true => "PENDING-WON",
-                    false => "PENDING-LOST",
-                };
-                let _ = sqlx::query!(
-                    "UPDATE bets_schema.bets SET status = $1 WHERE id = $2",
-                    new_status,
-                    bet.id
-                )
-                .execute(pool)
-                .await;
-                continue;
-            }
+        // Collect bet IDs by outcome and stage RabbitMQ events
+        let mut confirmed_won_ids = Vec::new();
+        let mut confirmed_lost_ids = Vec::new();
+        let mut pending_won_ids = Vec::new();
+        let mut pending_lost_ids = Vec::new();
+        let mut events_to_publish = Vec::new();
 
-            if bet.selection == event.winning_selection {
-                let _ = sqlx::query!(
-                    "UPDATE bets_schema.bets SET status = 'WON' WHERE id = $1",
-                    bet.id
-                )
-                .execute(pool)
-                .await;
-                let amount_f = bet.amount.to_f64().unwrap_or(0.0);
-                let odds_f = bet.odds_at_placement.to_f64().unwrap_or(1.0);
-                let payout = amount_f * odds_f;
-                let _ = publish_event(
-                    rmq,
-                    "betting_topic",
-                    "bet.won",
-                    BetWon {
+        for bet in bets {
+            let is_winner = bet.selection == event.winning_selection;
+
+            if bet.status == "PENDING" {
+                if is_winner {
+                    pending_won_ids.push(bet.id);
+                } else {
+                    pending_lost_ids.push(bet.id);
+                }
+            } else {
+                if is_winner {
+                    confirmed_won_ids.push(bet.id);
+
+                    let payout = bet.amount * bet.odds_at_placement;
+
+                    events_to_publish.push(BetWon {
                         bet_id: bet.id,
                         user_id: bet.user_id,
-                        payout_amount: payout,
-                    },
-                )
-                .await;
-            } else {
-                let _ = sqlx::query!(
-                    "UPDATE bets_schema.bets SET status = 'LOST' WHERE id = $1",
-                    bet.id
-                )
-                .execute(pool)
-                .await;
+                        payout_amount: payout.to_f64().unwrap_or(0.0),
+                    });
+                } else {
+                    confirmed_lost_ids.push(bet.id);
+                }
             }
+        }
+
+        // 2. Execute bulk updates in a single transaction
+        let mut tx = pool.begin().await.unwrap();
+
+        if !confirmed_won_ids.is_empty() {
+            sqlx::query!(
+                "UPDATE bets_schema.bets SET status = 'WON' WHERE id = ANY($1)",
+                &confirmed_won_ids
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        if !confirmed_lost_ids.is_empty() {
+            sqlx::query!(
+                "UPDATE bets_schema.bets SET status = 'LOST' WHERE id = ANY($1)",
+                &confirmed_lost_ids
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        if !pending_won_ids.is_empty() {
+            sqlx::query!(
+                "UPDATE bets_schema.bets SET status = 'PENDING-WON' WHERE id = ANY($1)",
+                &pending_won_ids
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        if !pending_lost_ids.is_empty() {
+            sqlx::query!(
+                "UPDATE bets_schema.bets SET status = 'PENDING-LOST' WHERE id = ANY($1)",
+                &pending_lost_ids
+            )
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+
+        tx.commit().await.unwrap();
+
+        // 3. Publish events after transaction succeeds
+        for event_msg in events_to_publish {
+            let _ = publish_event(rmq, "betting_topic", "bet.won", event_msg).await;
         }
     }
 
-    // Delete FAILED bets
+    // Bulk cleanup for FAILED bets
     let _ = sqlx::query!(
         "DELETE FROM bets_schema.bets WHERE event_id = $1 AND status = 'FAILED'",
         event.event_id

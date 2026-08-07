@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, user_id, selection, amount, odds_at_placement, status FROM bets_schema.bets WHERE event_id = $1 AND (status = 'CONFIRMED' OR status = 'PENDING') AND id > $2 ORDER BY id LIMIT $3",
+  "query": "SELECT id, user_id, amount, odds_at_placement, amount * odds_at_placement AS payout FROM bets_schema.bets WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -15,30 +15,23 @@
       },
       {
         "ordinal": 2,
-        "name": "selection",
-        "type_info": "Varchar"
-      },
-      {
-        "ordinal": 3,
         "name": "amount",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "odds_at_placement",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 5,
-        "name": "status",
-        "type_info": "Varchar"
+        "ordinal": 4,
+        "name": "payout",
+        "type_info": "Numeric"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -46,9 +39,8 @@
       false,
       false,
       false,
-      false,
-      false
+      null
     ]
   },
-  "hash": "6aa94156a0eacbce0c3fd3682d8da43c663a62a1cfc79e13ba41dea14c57f3e4"
+  "hash": "49f0bbef8049e4ad228b5cc8f2113a2372daf8d3d853d0dba4ace3c55da4e747"
 }
