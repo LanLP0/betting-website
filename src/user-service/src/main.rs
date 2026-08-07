@@ -21,6 +21,7 @@ struct Claims {
 #[derive(Deserialize)]
 struct RegisterReq {
     username: String,
+    email: String,
     password: String,
 }
 
@@ -72,9 +73,10 @@ async fn register(data: web::Data<AppState>, req: web::Json<RegisterReq>) -> imp
 
     let id = Uuid::new_v4();
     let query = sqlx::query!(
-        "INSERT INTO users_schema.users (id, username, password_hash) VALUES ($1, $2, $3)",
+        "INSERT INTO users_schema.users (id, username, email, password_hash) VALUES ($1, $2, $3, $4)",
         id,
         req.username,
+        req.email,
         hash
     )
     .execute(&data.db)
@@ -100,7 +102,7 @@ async fn register(data: web::Data<AppState>, req: web::Json<RegisterReq>) -> imp
                 role: "user".to_string(),
             })
         }
-        Err(_) => HttpResponse::Conflict().body("Username already exists"),
+        Err(_) => HttpResponse::Conflict().body("Username or email already exists"),
     }
 }
 

@@ -95,7 +95,7 @@ async fn handle_bet_requested(
     pool: &PgPool,
     rmq: &lapin::Channel,
     event: BetRequested,
-    delivery: lapin::message::Delivery,
+    delivery: &lapin::message::Delivery,
 ) {
     let mut tx = match pool.begin().await {
         Ok(t) => t,
@@ -408,7 +408,7 @@ async fn main() -> std::io::Result<()> {
                 let routing_key = delivery.routing_key.as_str();
                 if routing_key == "bet.requested" {
                     if let Ok(ev) = serde_json::from_slice::<BetRequested>(&delivery.data) {
-                        handle_bet_requested(&pool_clone2, &chan_clone2, ev, delivery).await;
+                        handle_bet_requested(&pool_clone2, &chan_clone2, ev, &delivery).await;
                     }
                 } else if routing_key == "bet.won" {
                     if let Ok(ev) = serde_json::from_slice::<BetWon>(&delivery.data) {
