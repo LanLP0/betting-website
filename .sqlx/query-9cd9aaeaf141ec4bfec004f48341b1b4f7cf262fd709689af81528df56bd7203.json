@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM bets_schema.bets WHERE event_id = $1 AND status = 'FAILED'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9cd9aaeaf141ec4bfec004f48341b1b4f7cf262fd709689af81528df56bd7203"
+}

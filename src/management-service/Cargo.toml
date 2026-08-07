@@ -1,0 +1,19 @@
+[package]
+name = "management-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+clickhouse = "0.12"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+lapin = "2.3"
+utoipa = { version = "4", features = ["actix_extras"] }
+utoipa-swagger-ui = { version = "6", features = ["actix-web"] }
+futures-util = "0.3.33"

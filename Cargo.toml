@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "src/user-service",
+    "src/wallet-service",
+    "src/betting-service",
+    "src/events-service",
+    "src/management-service"
+]
+resolver = "2"

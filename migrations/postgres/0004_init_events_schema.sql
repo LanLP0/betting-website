@@ -1,0 +1,10 @@
+CREATE SCHEMA IF NOT EXISTS events_schema;
+
+CREATE TABLE IF NOT EXISTS events_schema.events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'OPEN', -- OPEN, CLOSED, SETTLED
+    winning_selection VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE bets_schema.bets SET status = 'FAILED' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d7c4b6615834071bd14e6b0a6c9430f754e46e4155d8d9c2acebb27ae8ef1743"
+}
