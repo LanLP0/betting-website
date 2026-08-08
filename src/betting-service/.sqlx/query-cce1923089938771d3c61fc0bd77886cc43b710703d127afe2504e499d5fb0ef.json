@@ -1,10 +1,15 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT status FROM bets_schema.bets WHERE id = $1",
+  "query": "SELECT user_id, status FROM bets_schema.bets WHERE id = $1 LIMIT 1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
         "name": "status",
         "type_info": "Varchar"
       }
@@ -15,8 +20,9 @@
       ]
     },
     "nullable": [
+      false,
       false
     ]
   },
-  "hash": "8a912897d9f84419cefa351866528d0ba9ac9f9f79cb13929711861f7a83b05b"
+  "hash": "cce1923089938771d3c61fc0bd77886cc43b710703d127afe2504e499d5fb0ef"
 }

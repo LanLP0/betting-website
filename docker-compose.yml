@@ -1,11 +1,9 @@
-version: "3.8"
-
 services:
   nginx-gateway:
     image: nginx:alpine
     ports:
-      - "80:80"
-      - "443:443"
+      - "5555:80"
+      - "5556:443"
     volumes:
       - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
@@ -32,14 +30,16 @@ services:
     image: postgres:15-alpine
     environment:
       POSTGRES_DB: betting_platform
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: secretpass
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./migrations/postgres/0001_init_user_schema.sql:/docker-entrypoint-initdb.d/0001_init_user_schema.sql:ro
+      - ./migrations/postgres/0002_init_wallet_schema.sql:/docker-entrypoint-initdb.d/0002_init_wallet_schema.sql:ro
+      - ./migrations/postgres/0003_init_bets_schema.sql:/docker-entrypoint-initdb.d/0003_init_bets_schema.sql:ro
+      - ./migrations/postgres/0004_init_events_schema.sql:/docker-entrypoint-initdb.d/0004_init_events_schema.sql:ro
     networks:
       - betting-website-net
-    secrets:
-      - db_password
     deploy:
       replicas: 1
       restart_policy:
@@ -58,6 +58,7 @@ services:
     image: clickhouse/clickhouse-server
     volumes:
       - chdata:/var/lib/clickhouse
+      - ./migrations/clickhouse/0001_init_metrics.sql:/docker-entrypoint-initdb.d/0001_init_metrics.sql:ro
     networks:
       - betting-website-net
     deploy:
@@ -68,13 +69,11 @@ services:
   user-service:
     image: local/user-service:latest
     environment:
-      DATABASE_URL: postgres://admin:${DB_PASSWORD}@postgres-datastore:5432/betting_platform
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
       JWT_SECRET_FILE: /run/secrets/jwt_private_key
     networks:
       - betting-website-net
-    secrets:
-      - jwt_private_key
     depends_on:
       - rabbitmq-bus
       - postgres-datastore
@@ -86,7 +85,7 @@ services:
   wallet-service:
     image: local/wallet-service:latest
     environment:
-      DATABASE_URL: postgres://admin:${DB_PASSWORD}@postgres-datastore:5432/betting_platform
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
     networks:
       - betting-website-net
@@ -101,7 +100,7 @@ services:
   betting-service:
     image: local/betting-service:latest
     environment:
-      DATABASE_URL: postgres://admin:${DB_PASSWORD}@postgres-datastore:5432/betting_platform
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
       REDIS_URL: redis://redis-cache:6379/
     networks:
@@ -118,7 +117,7 @@ services:
   events-service:
     image: local/events-service:latest
     environment:
-      DATABASE_URL: postgres://admin:${DB_PASSWORD}@postgres-datastore:5432/betting_platform
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
       REDIS_URL: redis://redis-cache:6379/
     networks:
@@ -135,12 +134,14 @@ services:
   management-service:
     image: local/management-service:latest
     environment:
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       CLICKHOUSE_URL: http://clickhouse-warehouse:8123/
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
     networks:
       - betting-website-net
     depends_on:
       - rabbitmq-bus
+      - postgres-datastore
       - clickhouse-warehouse
     deploy:
       replicas: 1
@@ -155,11 +156,3 @@ networks:
 volumes:
   pgdata:
   chdata:
-
-secrets:
-  db_password:
-    external: true
-  jwt_private_key:
-    external: true
-  jwt_public_key:
-    external: true

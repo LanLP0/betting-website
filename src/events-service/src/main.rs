@@ -1,5 +1,6 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use actix_ws::Message;
+use backon::{ExponentialBuilder, Retryable};
 use futures_util::StreamExt;
 use rand::RngExt;
 use redis::AsyncCommands;
@@ -18,6 +19,10 @@ struct Event {
     id: Uuid,
     name: String,
     status: String,
+}
+
+async fn get_health() -> impl Responder {
+    HttpResponse::Ok().body("Ok")
 }
 
 async fn get_events(data: web::Data<AppState>) -> impl Responder {
@@ -151,8 +156,18 @@ async fn ws_route(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let db_url = env::var("DATABASE_URL").unwrap();
-    let pool = PgPoolOptions::new().connect(&db_url).await.unwrap();
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let pool = {
+        || async {
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&db_url)
+                .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_max_times(4))
+    .await
+    .unwrap();
 
     let redis_url = env::var("REDIS_URL").unwrap();
     let redis_client = redis::Client::open(redis_url).unwrap();
@@ -167,6 +182,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .route("/api/v1/events/health", web::get().to(get_health))
             .route("/api/v1/events", web::get().to(get_events))
             .route("/api/v1/events/{id}", web::get().to(get_event))
             .route("/api/v1/events/ws", web::get().to(ws_route))

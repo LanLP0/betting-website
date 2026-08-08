@@ -1,4 +1,5 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
+use backon::{ExponentialBuilder, Retryable};
 use bigdecimal::ToPrimitive;
 use futures_util::{lock::Mutex, stream::StreamExt};
 use lapin::{
@@ -31,6 +32,12 @@ struct BetRequested {
     bet_id: Uuid,
     user_id: Uuid,
     amount: f64,
+}
+
+#[derive(Serialize)]
+struct BetCancelled {
+    user_id: Uuid,
+    bet_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -87,19 +94,24 @@ async fn publish_event(
     .await
 }
 
+async fn get_health() -> impl Responder {
+    HttpResponse::Ok().body("Ok")
+}
+
 async fn place_bet(
     req: HttpRequest,
     data: web::Data<AppState>,
     body: web::Json<PlaceBetReq>,
 ) -> impl Responder {
-    // TODO check if event is still running
     let user_id_str = req.headers().get("X-User-ID").unwrap().to_str().unwrap();
     let user_id = Uuid::parse_str(user_id_str).unwrap();
 
     // Read odds from Redis
     let mut redis_conn = match data.redis_client.get_multiplexed_async_connection().await {
         Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().finish(),
+        Err(_) => {
+            return HttpResponse::BadRequest().body("Event has not started or already finished");
+        }
     };
 
     let odds_json: Option<String> = redis_conn.get(format!("odds:{}", body.event_id)).await.ok();
@@ -172,31 +184,60 @@ async fn place_bet(
 }
 
 async fn cancel_bet(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    // TODO check if event is still running
     let bet_id = Uuid::parse_str(req.match_info().get("id").unwrap()).unwrap();
-    let _ = sqlx::query!(
-        "UPDATE bets_schema.bets SET status = 'CANCELLED' WHERE id = $1 AND status = 'PENDING'",
+    let bet_status = sqlx::query!(
+        "SELECT user_id, status FROM bets_schema.bets WHERE id = $1 LIMIT 1",
         bet_id
     )
-    .execute(&data.db)
+    .fetch_optional(&data.db)
     .await;
-    // TODO return status
-    // TODO publish bet.cancelled
-    HttpResponse::Ok().finish()
+
+    if bet_status.is_err() {
+        return HttpResponse::InternalServerError().finish();
+    }
+
+    if let Some(s) = bet_status.unwrap() {
+        if s.status == "PENDING" {
+            // race condition: user published a bet, status set to PENDING, then cancel it before wallet.funds_locked is published --> bet gets cancelled but money is still deducted
+            // handled in handle_wallet_status() --> refund if CANCELLED, no-refund if WON/LOST
+            sqlx::query!(
+                "UPDATE bets_schema.bets SET status = 'CANCELLED' WHERE id = $1",
+                bet_id
+            )
+            .execute(&data.db)
+            .await;
+            publish_event(
+                &data.rmq,
+                "event_topic",
+                "bet.cancel",
+                BetCancelled {
+                    bet_id,
+                    user_id: s.user_id,
+                },
+            )
+            .await;
+            return HttpResponse::Ok().finish();
+        } else if s.status == "CANCELLED" || s.status == "FAILED" {
+            return HttpResponse::BadRequest().body("Bet is already CANCELLED or FAILED");
+        } else {
+            return HttpResponse::BadRequest().body("Bet is already processed");
+        }
+    }
+
+    HttpResponse::NotFound().finish()
 }
 
 async fn handle_wallet_status(pool: &PgPool, rmq: &lapin::Channel, status: WalletStatus) {
-    let current_status = sqlx::query!(
-        "SELECT status FROM bets_schema.bets WHERE id = $1",
+    let bet = sqlx::query!(
+        "SELECT user_id, status, odds_at_placement, amount FROM bets_schema.bets WHERE id = $1",
         status.bet_id
     )
     .fetch_one(pool)
     .await
-    .unwrap()
-    .status;
+    .unwrap();
 
     let new_status = if status.status == "SUCCESS" {
-        if current_status == "PENDING-WON" {
+        if bet.status == "PENDING-WON" {
             let bet = sqlx::query!(
                 "SELECT id, user_id, amount, odds_at_placement, amount * odds_at_placement AS payout FROM bets_schema.bets WHERE id = $1",
                 status.bet_id
@@ -217,8 +258,20 @@ async fn handle_wallet_status(pool: &PgPool, rmq: &lapin::Channel, status: Walle
             )
             .await;
             "WON"
-        } else if current_status == "PENDING-LOST" {
+        } else if bet.status == "PENDING-LOST" {
             "LOST"
+        } else if bet.status == "CANCELLED" {
+            publish_event(
+                rmq,
+                "betting_topic",
+                "bet.cancel.request_refund",
+                BetCancelled {
+                    user_id: bet.user_id,
+                    bet_id: status.bet_id,
+                },
+            )
+            .await;
+            "CANCELLED-REFUNDED"
         } else {
             "CONFIRMED"
         }
@@ -353,17 +406,32 @@ async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventS
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let db_url = env::var("DATABASE_URL").unwrap();
-    let pool = PgPoolOptions::new().connect(&db_url).await.unwrap();
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let pool = {
+        || async {
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&db_url)
+                .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_max_times(4))
+    .await
+    .unwrap();
+
+    let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
+    let rmq_conn =
+        { || async { Connection::connect(&rmq_url, ConnectionProperties::default()).await } }
+            .retry(ExponentialBuilder::default().with_max_times(4))
+            .await
+            .unwrap();
+    let rmq_chan = rmq_conn
+        .create_channel()
+        .await
+        .expect("Failed to create channel");
 
     let redis_url = env::var("REDIS_URL").unwrap();
     let redis_client = redis::Client::open(redis_url).unwrap();
-
-    let rmq_url = env::var("RABBITMQ_URL").unwrap();
-    let rmq_conn = Connection::connect(&rmq_url, ConnectionProperties::default())
-        .await
-        .unwrap();
-    let rmq_chan = rmq_conn.create_channel().await.unwrap();
 
     rmq_chan
         .exchange_declare(
@@ -435,10 +503,9 @@ async fn main() -> std::io::Result<()> {
                         && let Some(tx) = wallet_checkpoints_cloned.lock().await.remove(id.as_str())
                     {
                         let _ = tx.send(ev);
-                        continue;
+                    } else {
+                        handle_wallet_status(&pool_clone, &chan_clone, ev).await;
                     }
-
-                    handle_wallet_status(&pool_clone, &chan_clone, ev).await;
                 }
                 let _ = delivery
                     .ack(lapin::options::BasicAckOptions::default())
@@ -501,6 +568,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .route("/api/v1/bets/health", web::get().to(get_health))
             .route("/api/v1/bets", web::post().to(place_bet))
             .route("/api/v1/bets/{id}", web::delete().to(cancel_bet))
     })

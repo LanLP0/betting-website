@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE bets_schema.bets SET status = 'CANCELLED' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "87f041dd53b080d18b6a4632ed8c7623e2ddd8fef7bd4866e34a68b47a55d367"
+}

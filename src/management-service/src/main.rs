@@ -1,4 +1,5 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
+use backon::{ExponentialBuilder, Retryable};
 use clickhouse::Client;
 use futures_util::stream::StreamExt;
 use lapin::{BasicProperties, Connection, ConnectionProperties, options::*, types::FieldTable};
@@ -62,6 +63,10 @@ async fn is_admin(req: &HttpRequest) -> bool {
     } else {
         false
     }
+}
+
+async fn get_health() -> impl Responder {
+    HttpResponse::Ok().body("Ok")
 }
 
 async fn add_user(
@@ -153,17 +158,30 @@ async fn get_metrics(req: HttpRequest, data: web::Data<AppState>) -> impl Respon
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let db_url = env::var("DATABASE_URL").unwrap();
-    let pool = PgPoolOptions::new().connect(&db_url).await.unwrap();
+    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
 
-    let ch_url = env::var("CLICKHOUSE_URL").unwrap();
-    let ch = Client::default().with_url(&ch_url);
+    let pool = {
+        || async {
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&db_url)
+                .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_max_times(4))
+    .await
+    .unwrap();
 
-    let rmq_url = env::var("RABBITMQ_URL").unwrap();
-    let rmq_conn = Connection::connect(&rmq_url, ConnectionProperties::default())
+    let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
+    let rmq_conn =
+        { || async { Connection::connect(&rmq_url, ConnectionProperties::default()).await } }
+            .retry(ExponentialBuilder::default().with_max_times(4))
+            .await
+            .unwrap();
+    let rmq_chan = rmq_conn
+        .create_channel()
         .await
-        .unwrap();
-    let rmq_chan = rmq_conn.create_channel().await.unwrap();
+        .expect("Failed to create channel");
     rmq_chan
         .exchange_declare(
             "event_topic",
@@ -173,6 +191,9 @@ async fn main() -> std::io::Result<()> {
         )
         .await
         .unwrap();
+
+    let ch_url = env::var("CLICKHOUSE_URL").unwrap();
+    let ch = Client::default().with_url(&ch_url);
 
     // Consumer for Metrics
     let chan_clone = rmq_chan.clone();
@@ -270,6 +291,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .route("/api/v1/management/health", web::get().to(get_health))
             .route("/api/v1/management/users/add", web::post().to(add_user))
             .route("/api/v1/management/events/add", web::post().to(add_event))
             .route(

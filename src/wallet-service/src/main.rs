@@ -1,4 +1,6 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
+use backon::ExponentialBuilder;
+use backon::Retryable;
 use bigdecimal::ToPrimitive;
 use futures_util::stream::StreamExt;
 use lapin::{
@@ -39,6 +41,12 @@ struct BetWon {
     bet_id: Uuid,
     user_id: Uuid,
     payout_amount: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BetCancelled {
+    user_id: Uuid,
+    bet_id: Uuid,
 }
 
 #[derive(Serialize)]
@@ -194,6 +202,45 @@ async fn handle_bet_won(pool: &PgPool, event: BetWon) {
     let _ = tx.commit().await;
 }
 
+async fn handle_bet_cancel_request_refund(
+    pool: &PgPool,
+    rmq: &lapin::Channel,
+    event: BetCancelled,
+) {
+    let trans = sqlx::query!("SELECT * FROM wallet_schema.transactions WHERE user_id = $1 AND type = 'BET_PLACED' AND reference_id = $2", event.user_id, event.bet_id).fetch_optional(pool).await;
+    if let Some(t) = trans.unwrap() {
+        let mut tx = pool.begin().await.unwrap();
+        let _ = sqlx::query!(
+            "UPDATE wallet_schema.wallets SET balance = balance + $1 WHERE user_id = $2",
+            t.amount,
+            event.user_id
+        )
+        .execute(&mut *tx)
+        .await;
+        let _ = sqlx::query!(
+            "INSERT INTO wallet_schema.transactions (user_id, amount, type, reference_id) VALUES ($1, $2, 'REFUND', $3)",
+            event.user_id,
+            t.amount,
+            event.bet_id
+        ).execute(&mut *tx).await;
+        let _ = tx.commit().await;
+        publish_event(
+            rmq,
+            "betting_topic",
+            "bet.cancel.refunded",
+            WalletStatus {
+                bet_id: event.bet_id,
+                status: "SUCCESS".into(),
+            },
+        )
+        .await;
+    }
+}
+
+async fn get_health() -> impl Responder {
+    HttpResponse::Ok().body("Ok")
+}
+
 async fn get_balance(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     let user_id_str = req.headers().get("X-User-ID").unwrap().to_str().unwrap();
     let user_id = Uuid::parse_str(user_id_str).unwrap();
@@ -285,17 +332,28 @@ async fn withdraw(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .unwrap();
+    let pool = {
+        || async {
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&db_url)
+                .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_max_times(4))
+    .await
+    .unwrap();
 
-    let rmq_url = env::var("RABBITMQ_URL").unwrap();
-    let rmq_conn = Connection::connect(&rmq_url, ConnectionProperties::default())
+    let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
+    let rmq_conn =
+        { || async { Connection::connect(&rmq_url, ConnectionProperties::default()).await } }
+            .retry(ExponentialBuilder::default().with_max_times(4))
+            .await
+            .unwrap();
+    let rmq_chan = rmq_conn
+        .create_channel()
         .await
-        .unwrap();
-    let rmq_chan = rmq_conn.create_channel().await.unwrap();
+        .expect("Failed to create channel");
 
     rmq_chan
         .exchange_declare(
@@ -393,6 +451,16 @@ async fn main() -> std::io::Result<()> {
             )
             .await
             .unwrap();
+        chan_clone2
+            .queue_bind(
+                q.name().as_str(),
+                "betting_topic",
+                "bet.cancel.request_refund",
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .unwrap();
         let mut consumer = chan_clone2
             .basic_consume(
                 q.name().as_str(),
@@ -414,7 +482,12 @@ async fn main() -> std::io::Result<()> {
                     if let Ok(ev) = serde_json::from_slice::<BetWon>(&delivery.data) {
                         handle_bet_won(&pool_clone2, ev).await;
                     }
+                } else if routing_key == "bet.cancel.request_refund" {
+                    if let Ok(ev) = serde_json::from_slice::<BetCancelled>(&delivery.data) {
+                        handle_bet_cancel_request_refund(&pool_clone2, &chan_clone2, ev).await;
+                    }
                 }
+
                 let _ = delivery
                     .ack(lapin::options::BasicAckOptions::default())
                     .await;
@@ -429,6 +502,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .route("/api/v1/wallet/health", web::get().to(get_health))
             .route("/api/v1/wallet/{id}", web::get().to(get_balance))
             .route("/api/v1/wallet/{id}/deposit", web::post().to(deposit))
             .route("/api/v1/wallet/{id}/withdraw", web::post().to(withdraw))

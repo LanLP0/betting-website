@@ -16,3 +16,4 @@ lapin = "2.3"
 redis = { version = "0.24", features = ["tokio-comp"] }
 futures-util = "0.3.32"
 bigdecimal = "0.3.1"
+backon = "1.6.0"

@@ -17,3 +17,4 @@ lapin = "2.3"
 utoipa = { version = "4", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "6", features = ["actix-web"] }
 futures-util = "0.3.33"
+backon = "1.6.0"

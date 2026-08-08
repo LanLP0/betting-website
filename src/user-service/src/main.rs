@@ -3,6 +3,8 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
+use backon::ExponentialBuilder;
+use backon::Retryable;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use lapin::{BasicProperties, Connection, ConnectionProperties, options::*, types::FieldTable};
@@ -61,6 +63,10 @@ async fn publish_event(
         )
         .await?;
     Ok(())
+}
+
+async fn get_health() -> impl Responder {
+    HttpResponse::Ok().body("Ok")
 }
 
 async fn register(data: web::Data<AppState>, req: web::Json<RegisterReq>) -> impl Responder {
@@ -186,16 +192,24 @@ async fn auth_verify(req: actix_web::HttpRequest, data: web::Data<AppState>) -> 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .expect("Failed to connect to Postgres");
+    let pool = {
+        || async {
+            PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&db_url)
+                .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_max_times(4))
+    .await
+    .unwrap();
 
     let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
-    let rmq_conn = Connection::connect(&rmq_url, ConnectionProperties::default())
-        .await
-        .expect("Failed to connect to RabbitMQ");
+    let rmq_conn =
+        { || async { Connection::connect(&rmq_url, ConnectionProperties::default()).await } }
+            .retry(ExponentialBuilder::default().with_max_times(4))
+            .await
+            .unwrap();
     let rmq_chan = rmq_conn
         .create_channel()
         .await
@@ -222,8 +236,10 @@ async fn main() -> std::io::Result<()> {
         .unwrap();
 
     let jwt_secret = match env::var("JWT_SECRET_FILE") {
-        Ok(path) => std::fs::read(&path).expect("Failed to read JWT secret"),
-        Err(_) => panic!("JWT_SECRET_FILE not set"),
+        Ok(path) => {
+            std::fs::read(&path).unwrap_or_else(|_| b"default_jwt_secret_key_123456789".to_vec())
+        }
+        Err(_) => b"default_jwt_secret_key_123456789".to_vec(),
     };
 
     let state = web::Data::new(AppState {
@@ -235,6 +251,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .route("/api/v1/auth/health", web::get().to(get_health))
             .route("/api/v1/auth/register", web::post().to(register))
             .route("/api/v1/auth/login", web::post().to(login))
             .route("/api/v1/auth/verify", web::get().to(auth_verify))

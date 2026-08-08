@@ -17,3 +17,4 @@ lapin = "2.3"
 redis = { version = "0.24", features = ["tokio-comp"] }
 futures-util = "0.3.33"
 rand = "0.10.2"
+backon = "1.6.0"
