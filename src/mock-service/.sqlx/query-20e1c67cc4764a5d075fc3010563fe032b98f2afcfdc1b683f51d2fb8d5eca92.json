@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT response_status_code, response_body FROM mock_schema.idempotency_keys WHERE idempotency_key = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "response_status_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "response_body",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "20e1c67cc4764a5d075fc3010563fe032b98f2afcfdc1b683f51d2fb8d5eca92"
+}

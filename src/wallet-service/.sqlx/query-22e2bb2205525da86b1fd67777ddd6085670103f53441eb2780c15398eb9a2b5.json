@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE wallet_schema.wallets SET payment_gateway_token = $1 WHERE user_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "22e2bb2205525da86b1fd67777ddd6085670103f53441eb2780c15398eb9a2b5"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT teams, odds FROM mock_schema.events WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "teams",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 1,
+        "name": "odds",
+        "type_info": "NumericArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5d115277c05574aa03f6cfcb3b1dd5ca56c1a322dd9ab591de5310777ac00ac5"
+}

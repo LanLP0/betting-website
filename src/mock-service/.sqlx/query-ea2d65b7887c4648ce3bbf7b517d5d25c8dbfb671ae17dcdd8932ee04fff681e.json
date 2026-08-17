@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mock_schema.idempotency_keys (idempotency_key, response_status_code, response_body) VALUES ($1, 200, $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ea2d65b7887c4648ce3bbf7b517d5d25c8dbfb671ae17dcdd8932ee04fff681e"
+}

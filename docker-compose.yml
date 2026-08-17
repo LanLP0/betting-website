@@ -1,11 +1,15 @@
 services:
   nginx-gateway:
-    image: nginx:alpine
+    image: openresty/openresty:alpine
     ports:
       - "5555:80"
       - "5556:443"
     volumes:
       - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx-auth_proxy_params.conf:/etc/nginx/auth_proxy_params:ro
+      - ./config/nginx-proxy_params.conf:/etc/nginx/proxy_params:ro
+      - ./config/keys/betting-website.crt:/etc/nginx/certs/betting-website.crt:ro
+      - ./config/keys/betting-website.key:/etc/nginx/certs/betting-website.key:ro
     networks:
       - betting-website-net
     deploy:
@@ -38,6 +42,8 @@ services:
       - ./migrations/postgres/0002_init_wallet_schema.sql:/docker-entrypoint-initdb.d/0002_init_wallet_schema.sql:ro
       - ./migrations/postgres/0003_init_bets_schema.sql:/docker-entrypoint-initdb.d/0003_init_bets_schema.sql:ro
       - ./migrations/postgres/0004_init_events_schema.sql:/docker-entrypoint-initdb.d/0004_init_events_schema.sql:ro
+      - ./migrations/postgres/0005_init_notification_schema.sql:/docker-entrypoint-initdb.d/0005_init_notification_schema.sql:ro
+      - ./migrations/postgres/0006_init_mock_schema.sql:/docker-entrypoint-initdb.d/0006_init_mock_schema.sql:ro
     networks:
       - betting-website-net
     deploy:
@@ -71,7 +77,11 @@ services:
     environment:
       DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
-      JWT_SECRET_FILE: /run/secrets/jwt_private_key
+      JWT_PRIVATE_KEY_FILE: /run/secrets/jwt_private_key
+      JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
+    secrets:
+      - jwt_private_key
+      - jwt_public_key
     networks:
       - betting-website-net
     depends_on:
@@ -87,6 +97,8 @@ services:
     environment:
       DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
+      WEBHOOK_SECRET: "shared_production_webhook_secret_key_12345"
+      MOCK_SERVICE_URL: "http://mock-service:8080"
     networks:
       - betting-website-net
     depends_on:
@@ -120,6 +132,7 @@ services:
       DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
       RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
       REDIS_URL: redis://redis-cache:6379/
+      WEBHOOK_SECRET: "shared_production_webhook_secret_key_12345"
     networks:
       - betting-website-net
     depends_on:
@@ -148,6 +161,48 @@ services:
       restart_policy:
         condition: on-failure
 
+  notification-service:
+    image: local/notification-service:latest
+    environment:
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
+      REDIS_URL: redis://redis-cache:6379/
+    networks:
+      - betting-website-net
+    depends_on:
+      - rabbitmq-bus
+      - postgres-datastore
+      - redis-cache
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+
+  mock-service:
+    image: local/mock-service:latest
+    environment:
+      DATABASE_URL: postgres://pguser:secretpass@postgres-datastore:5432/betting_platform
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq-bus:5672/%2f
+      WEBHOOK_SECRET: "shared_production_webhook_secret_key_12345"
+      FAILURE_RATE: "0.0"
+      LATENCY_MIN_MS: "0"
+      LATENCY_MAX_MS: "0"
+      WEBHOOK_TIMEOUT_RATE: "0.0"
+    networks:
+      - betting-website-net
+    depends_on:
+      - postgres-datastore
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+secrets:
+  jwt_private_key:
+    file: ./config/keys/jwt_private_key.pem
+  jwt_public_key:
+    file: ./config/keys/jwt_public_key.pem
+
 networks:
   betting-website-net:
     driver: overlay
@@ -156,3 +211,4 @@ networks:
 volumes:
   pgdata:
   chdata:
+

@@ -183,3 +183,6 @@ dist-ssr/
 
 # Vite dev server
 vite.config.ts.timestamp-*
+
+# Keys
+config/keys/

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mock_schema.payment_information (token, account_number, account_name, bank_name, bank_code) VALUES ($1, '1234567890', 'Mock Account', 'Test Bank', 'TEST01')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "946ad69c2de472dbd02fc257943ee68f9091c095bd66f9260a4d61c50b1af3d8"
+}

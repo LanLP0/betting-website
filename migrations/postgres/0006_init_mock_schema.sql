@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS mock_schema.payment_information (
 CREATE TABLE IF NOT EXISTS mock_schema.deposit_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL,
-    amount DECIMAL(12, 2) NOT NULL,
+    amount DECIMAL(19, 4) NOT NULL,
     client_secret VARCHAR(255) NOT NULL UNIQUE, -- Lookup key for user confirmation
     status VARCHAR(50) NOT NULL DEFAULT 'pending', -- pending, confirmed, expired
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -45,8 +45,6 @@ CREATE TABLE IF NOT EXISTS mock_schema.webhook_deliveries (
     event_type VARCHAR(100) NOT NULL, -- e.g. 'deposit.confirmed', 'payment.registered'
     payload JSONB NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'pending', -- pending, delivered, failed
-    attempts INT NOT NULL DEFAULT 0,
-    max_attempts INT NOT NULL DEFAULT 3,
     last_attempt_at TIMESTAMP WITH TIME ZONE,
     next_retry_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP

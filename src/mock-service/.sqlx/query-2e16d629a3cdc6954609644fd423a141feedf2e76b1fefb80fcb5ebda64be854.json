@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mock_schema.deposit_requests (id, user_id, amount, client_secret, status) VALUES ($1, $2, $3, $4, 'pending')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Numeric",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2e16d629a3cdc6954609644fd423a141feedf2e76b1fefb80fcb5ebda64be854"
+}

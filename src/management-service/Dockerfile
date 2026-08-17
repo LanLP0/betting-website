@@ -4,19 +4,21 @@ RUN cargo install cargo-chef --version ^0.1
 ENV RUSTC_WRAPPER=sccache SCCACHE_DIR=/sccache
 
 FROM base AS planner
-WORKDIR /app
+WORKDIR /app/service
 COPY . .
+COPY ../betting-common ../betting-common
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo chef prepare --recipe-path recipe.json
 
 FROM base as builder
-WORKDIR /app
+WORKDIR /app/service
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
 COPY . .
+COPY ../betting-common ../betting-common
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo build --release --bin management-service

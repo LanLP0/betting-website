@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO wallet_schema.transactions (user_id, amount, type, reference_id) VALUES ($1, $2, 'DEPOSIT', $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Numeric",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5a64470703e4d1bfeb1693a2e39b8545023c0a129fe19f1cd5d93be8cf49a7f9"
+}

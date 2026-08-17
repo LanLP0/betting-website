@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mock_schema.events SET odds = $1 WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "NumericArray",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3611d0c7c3a18646e48965c217a54ffa7e76187c8e6a17d137c607a356eecb17"
+}
