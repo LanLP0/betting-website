@@ -1,18 +1,32 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middleware::Logger, web};
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
-    Event, EventOdds, OddsRpcRequest, OddsRpcResponse, connect_pg, connect_rmq, exchanges,
-    get_odds_for_event, publish_event_props, publish_event_with_trace, req_get_request_id,
-    verify_hmac_signature,
+    Event, EventOdds, EventSettled, OddsRpcRequest, OddsRpcResponse, connect_pg, connect_rmq,
+    exchanges, get_odds_for_event, http::BadRequestResponse, publish_event_props,
+    publish_event_with_trace, req_get_request_id, req_get_user_role, verify_hmac_signature,
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use futures_util::stream::StreamExt;
 use lapin::{BasicProperties, options::*, types::FieldTable};
 use redis::AsyncCommands;
+use serde::Deserialize;
 use sqlx::PgPool;
 use std::{env, time::Duration};
 use tokio::time::sleep;
 use uuid::Uuid;
+
+#[derive(Deserialize)]
+struct AddEventReq {
+    name: String,
+    description: Option<String>,
+    teams: Vec<String>,
+    odds: Vec<f64>,
+}
+
+#[derive(Deserialize)]
+struct SettleEventReq {
+    winning_selection: String,
+}
 
 struct AppState {
     db: PgPool,
@@ -28,11 +42,18 @@ async fn get_health() -> impl Responder {
 // TODO pagination
 // Checked
 async fn get_events(data: web::Data<AppState>) -> impl Responder {
-    let rows_req = {|| async {sqlx::query!(
-        "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events ORDER BY created_at DESC"
-    )
-    .fetch_all(&data.db)
-    .await}}.retry(ExponentialBuilder::default().with_jitter()).when(betting_common::sqlx_retry_when).await;
+    let rows_req = {
+        || async {
+            sqlx::query!(
+                "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events ORDER BY created_at DESC"
+            )
+            .fetch_all(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
     if rows_req.is_err() {
         return HttpResponse::InternalServerError().finish();
@@ -107,6 +128,327 @@ async fn get_event_odds(path: web::Path<Uuid>, data: web::Data<AppState>) -> imp
     }
 }
 
+async fn add_event(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    body: web::Json<AddEventReq>,
+) -> impl Responder {
+    let auth_user_role = req_get_user_role(&req);
+    if auth_user_role != "admin" {
+        return HttpResponse::Forbidden().finish();
+    }
+
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 255 {
+        return HttpResponse::BadRequest().body("Event name must be between 1 and 255 characters");
+    }
+
+    if body.teams.len() < 2 {
+        return HttpResponse::BadRequest().body("An event must have at least 2 teams");
+    }
+
+    if body.odds.len() != body.teams.len() {
+        return HttpResponse::BadRequest().body("Odds array length must match teams array length");
+    }
+
+    for (team, odd) in body.teams.iter().zip(body.odds.iter()) {
+        if team.trim().is_empty() {
+            return HttpResponse::BadRequest().body("Team names cannot be empty");
+        }
+        if *odd < 1.01 || odd.is_nan() || odd.is_infinite() {
+            return HttpResponse::BadRequest().body("All odds values must be at least 1.01");
+        }
+    }
+
+    let description = body
+        .description
+        .clone()
+        .unwrap_or_else(|| "Sporting match".to_string());
+
+    let odds_dec: Vec<BigDecimal> = body
+        .odds
+        .iter()
+        .map(|o| BigDecimal::from_f64(*o).unwrap_or_else(|| BigDecimal::from(2)))
+        .collect();
+
+    let id = Uuid::new_v4();
+    let insert_res = {
+        || async {
+            sqlx::query!(
+                r#"
+                INSERT INTO events_schema.events (id, name, description, status, teams, odds)
+                VALUES ($1, $2, $3, 'open', $4, $5)
+                "#,
+                id,
+                name,
+                description,
+                &body.teams,
+                &odds_dec as &[BigDecimal]
+            )
+            .execute(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    match insert_res {
+        Ok(_) => {
+            let trace_id = req_get_request_id(&req);
+            let payload_val = serde_json::json!(EventOdds {
+                event_id: id,
+                status: "open".into(),
+                winning_selection: None,
+                teams: body.teams.clone(),
+                odds: body.odds.clone()
+            });
+
+            // Cache in Redis for high-speed FastPath reads
+            if let Ok(mut conn) = data.redis.get_multiplexed_async_connection().await {
+                let payload_str = serde_json::to_string(&payload_val).unwrap_or_default();
+                let redis_key = format!("odds:{}", id);
+                let _: () = conn
+                    .set_ex(redis_key, payload_str, 3000)
+                    .await
+                    .unwrap_or(());
+            }
+
+            // Publish event.created to Event topic exchange
+            let _ = publish_event_with_trace(
+                &data.rmq,
+                exchanges::EVENT,
+                "event.created",
+                &payload_val,
+                &trace_id,
+            )
+            .await;
+
+            HttpResponse::Created().json(serde_json::json!({ "id": id }))
+        }
+        Err(e) => {
+            log::error!("Database error in add_event: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
+/*
+ * ARCHITECTURAL NOTICE: EVENT DELETION & CACHE INVALIDATION
+ *
+ * Context & Scenario:
+ * Deletes an event from PostgreSQL, invalidates Redis odds cache, and publishes
+ * `event.deleted` to notify connected clients and downstream microservices.
+ */
+async fn delete_event(
+    req: HttpRequest,
+    path: web::Path<Uuid>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let auth_user_role = req_get_user_role(&req);
+    if auth_user_role != "admin" {
+        return HttpResponse::Forbidden().finish();
+    }
+
+    let id = path.into_inner();
+    let delete_res = {
+        || async {
+            sqlx::query!(
+                "DELETE FROM events_schema.events WHERE id = $1 RETURNING id",
+                id
+            )
+            .fetch_optional(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    match delete_res {
+        Ok(Some(_)) => {
+            let trace_id = req_get_request_id(&req);
+
+            // Invalidate Redis cache
+            if let Ok(mut conn) = data.redis.get_multiplexed_async_connection().await {
+                let redis_key = format!("odds:{}", id);
+                let _: () = conn.del(redis_key).await.unwrap_or(());
+            }
+
+            let ev = serde_json::json!({ "event_id": id });
+            let _ = publish_event_with_trace(
+                &data.rmq,
+                exchanges::EVENT,
+                "event.deleted",
+                &ev,
+                &trace_id,
+            )
+            .await;
+
+            HttpResponse::Ok().finish()
+        }
+        Ok(None) => HttpResponse::NotFound().body("Event not found"),
+        Err(e) => {
+            log::error!("Database error in delete_event: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
+/*
+ * ARCHITECTURAL NOTICE: EVENT SETTLEMENT SAGA ORCHESTRATION & IDEMPOTENCY
+ *
+ * Context & Scenario:
+ * Settle an event and trigger the downstream settlement Saga across Betting and Wallet services.
+ *
+ * Saga Workflow:
+ * 1. Atomically updates the event status to `SETTLED` in `events_schema.events` with `settled_at = NOW()`.
+ *    - Guarantees settlement cannot execute twice for an already settled match (`WHERE status != 'SETTLED'`).
+ * 2. Updates Redis cache with `SETTLED` status and winning team.
+ * 3. Emits `event.settled` over RabbitMQ (`exchanges::EVENT`) with distributed `trace_id`.
+ * 4. Consumed by Betting Service:
+ *    - Evaluates all `CONFIRMED` and `PENDING` bets for this match.
+ *    - Sets winners to `WON` and losers to `LOST`.
+ *    - Emits `bet.won` events to Wallet Service to credit user balances.
+ */
+async fn settle_event(
+    req: HttpRequest,
+    path: web::Path<Uuid>,
+    data: web::Data<AppState>,
+    body: web::Json<SettleEventReq>,
+) -> impl Responder {
+    let auth_user_role = req_get_user_role(&req);
+    if auth_user_role != "admin" {
+        return HttpResponse::Forbidden().finish();
+    }
+
+    let event_id = path.into_inner();
+    let winning_selection = body.winning_selection.trim();
+    if winning_selection.is_empty() {
+        return HttpResponse::BadRequest().body("Winning selection cannot be empty");
+    }
+
+    // 1. Verify event exists and validate that winning_selection is among the match teams
+    let event_row = {
+        || async {
+            sqlx::query!(
+                "SELECT status, teams, odds FROM events_schema.events WHERE id = $1",
+                event_id
+            )
+            .fetch_optional(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    let event = match event_row {
+        Ok(Some(ev)) => ev,
+        Ok(None) => return HttpResponse::NotFound().body("Event not found"),
+        Err(e) => {
+            log::error!(
+                "Database query failed in settle_event (ev_id: {}): {:?}",
+                event_id,
+                e
+            );
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    if event.status == "SETTLED" {
+        return HttpResponse::BadRequest().json(BadRequestResponse {
+            status: "failed".into(),
+            err_code: "event_already_settled".into(),
+            should_retry: false,
+            msg: Some("Event is already settled".into()),
+        });
+    }
+
+    if !event.teams.iter().any(|t| t == winning_selection) {
+        return HttpResponse::BadRequest().json(BadRequestResponse {
+            status: "failed".into(),
+            err_code: "invalid_params".into(),
+            should_retry: false,
+            msg: Some("Winning selection must match one of the participating teams".into()),
+        });
+    }
+
+    // 2. Atomically settle event in PostgreSQL
+    let update_res = {
+        || async {
+            sqlx::query!(
+                r#"
+                UPDATE events_schema.events 
+                SET status = 'SETTLED', winning_selection = $1, settled_at = NOW() 
+                WHERE id = $2 AND status != 'SETTLED'
+                RETURNING id
+                "#,
+                winning_selection,
+                event_id
+            )
+            .fetch_optional(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    match update_res {
+        Ok(Some(_)) => {
+            let trace_id = req_get_request_id(&req);
+
+            // Update Redis cache with SETTLED state
+            if let Ok(mut conn) = data.redis.get_multiplexed_async_connection().await {
+                let payload_val = serde_json::json!(EventOdds {
+                    event_id,
+                    status: "SETTLED".into(),
+                    winning_selection: Some(winning_selection.to_string()),
+                    teams: event.teams,
+                    odds: event
+                        .odds
+                        .into_iter()
+                        .map(|o| o.to_f64().unwrap_or(0.0))
+                        .collect(),
+                });
+                let payload_str = serde_json::to_string(&payload_val).unwrap_or_default();
+                let redis_key = format!("odds:{}", event_id);
+                let _: () = conn
+                    .set_ex(redis_key, payload_str, 3000)
+                    .await
+                    .unwrap_or(());
+            }
+
+            let ev = EventSettled {
+                event_id,
+                winning_selection: winning_selection.to_string(),
+            };
+
+            let _ = publish_event_with_trace(
+                &data.rmq,
+                exchanges::EVENT,
+                "event.settled",
+                &ev,
+                &trace_id,
+            )
+            .await;
+
+            HttpResponse::Ok().finish()
+        }
+        Ok(None) => HttpResponse::BadRequest().json(BadRequestResponse {
+            status: "failed".into(),
+            err_code: "event_already_settled".into(),
+            should_retry: false,
+            msg: Some("Event already settled or concurrently updated".into()),
+        }),
+        Err(e) => {
+            log::error!("Database error updating event settlement: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
 // Checked
 async fn events_callback(
     req: HttpRequest,
@@ -133,7 +475,10 @@ async fn events_callback(
 
     if let Ok(mut conn) = data.redis.get_multiplexed_async_connection().await {
         let payload_str = serde_json::to_string(&payload_val).unwrap_or_default();
-        let _: () = conn.set_ex(redis_key, payload_str, 60).await.unwrap_or(());
+        let _: () = conn
+            .set_ex(redis_key, payload_str, 3000)
+            .await
+            .unwrap_or(());
     }
 
     let odds_d = body
@@ -142,14 +487,19 @@ async fn events_callback(
         .map(|o| BigDecimal::from_f64(*o).unwrap_or_default())
         .collect::<Vec<BigDecimal>>();
 
-    let _ = {|| async {
-        sqlx::query!(
-            "UPDATE events_schema.events SET status = $1, winning_selection = $2, odds = $3 WHERE id = $4",
-            &body.status, body.winning_selection, odds_d.as_slice(), body.event_id
-        )
-        .execute(&data.db)
-        .await
-    }}.retry(ExponentialBuilder::default().with_jitter()).when(betting_common::sqlx_retry_when).await;
+    let _ = {
+        || async {
+            sqlx::query!(
+                "UPDATE events_schema.events SET status = $1, winning_selection = $2, odds = $3 WHERE id = $4",
+                &body.status, body.winning_selection, odds_d.as_slice(), body.event_id
+            )
+            .execute(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
     let trace_id = req_get_request_id(&req);
     // Publish event updated to RabbitMQ
@@ -289,6 +639,12 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             .route("/api/v1/events/health", web::get().to(get_health))
             .route("/api/v1/events", web::get().to(get_events))
+            .route("/api/v1/events/mgmt/add", web::post().to(add_event))
+            .route("/api/v1/events/mgmt/{id}", web::delete().to(delete_event))
+            .route(
+                "/api/v1/events/mgmt/{id}/settle",
+                web::post().to(settle_event),
+            )
             .route("/api/v1/events/callback", web::post().to(events_callback))
             .route("/api/v1/events/{id}", web::get().to(get_event))
             .route("/api/v1/events/{id}/odds", web::get().to(get_event_odds))

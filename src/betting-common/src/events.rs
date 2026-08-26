@@ -129,7 +129,10 @@ pub async fn get_odds_for_event(
             if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
                 let payload_str =
                     serde_json::to_string(&event_odds.as_ref().unwrap()).unwrap_or_default();
-                let _: () = conn.set_ex(redis_key, payload_str, 60).await.unwrap_or(());
+                let _: () = conn
+                    .set_ex(redis_key, payload_str, 3000)
+                    .await
+                    .unwrap_or(());
             }
         }
     }

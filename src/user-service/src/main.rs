@@ -62,7 +62,7 @@ async fn get_health() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
-// TODO create unified functions for name, password, email check with detailed error description (used in management-service as well)
+// TODO create unified functions for name, password, email check with detailed error description
 
 /*
  * =========================================================================================

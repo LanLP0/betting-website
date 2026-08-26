@@ -183,16 +183,14 @@ API specs are displayed with Swagger UI at `/api/swagger` (hosted by Management 
 | Event Service        | `GET /api/v1/events/:id`                    | Get event details                                            | \_                                   |
 | Event Service        | `GET /api/v1/events/:id/odds`               | Get event odds                                               | \_                                   |
 | Event Service        | `POST /api/v1/events/callback`              | Callback from event supplier to updates to events            | Client Secret (attached in metadata) |
+| Event Service        | `POST /api/v1/events/mgmt/add`              | Add an event                                                 | Bearer JWT/Admin                     |
+| Event Service        | `DELETE /api/v1/events/mgmt/:id`            | Delete an event                                              | Bearer JWT/Admin                     |
+| Event Service        | `POST /api/v1/events/mgmt/:id/settle`       | Settle an event                                              | Bearer JWT/Admin                     |
 | Betting Service      | `POST /api/v1/bets`                         | Place a bet                                                  | Bearer JWT                           |
 | Betting Service      | `DELETE /api/v1/bets/:id`                   | Cancel a bet                                                 | Bearer JWT                           |
 | Betting Service      | `GET /api/v1/bets/event/:id`                | Get bet metrics for event                                    | Bearer JWT                           |
 | Betting Service      | `GET /api/v1/bets/user/:id`                 | Get all bets by user                                         | Bearer JWT                           |
 | Management Service   | `GET /api/v1/management/metrics`            | Get metrics                                                  | Bearer JWT/Admin                     |
-| Management Service   | `POST /api/v1/management/users/add`         | Add an user                                                  | Bearer JWT/Admin                     |
-| Management Service   | `DELETE /api/v1/management/users/:id`       | Delete an user                                               | Bearer JWT/Admin                     |
-| Management Service   | `POST /api/v1/management/events/add`        | Add an event                                                 | Bearer JWT/Admin                     |
-| Management Service   | `DELETE /api/v1/management/events/:id`      | Delete an event                                              | Bearer JWT/Admin                     |
-| Management Service   | `POST /api/v1/management/events/:id/settle` | Settle an event                                              | Bearer JWT/Admin                     |
 | All                  | `GET /api/v1/management/swagger`            | Get API specifications                                       | Bearer JWT/Admin                     |
 | Notification Service | `GET /api/v1/notifications/:id`             | Get all notifications for a user                             | Bearer JWT                           |
 | Notification Service | `PUT /api/v1/notifications/read`            | Mark (all) notification(s) as read (select via payload)      | Bearer JWT                           |
@@ -231,17 +229,20 @@ internal messaging.
 
 ### Mock Service
 
-| Endpoint                             | Description                                                      | Request                                    | Response                                                   |
-| ------------------------------------ | ---------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------- |
-| `POST /mock/api/v1/deposit/request`  | Request a deposit (server to server)                             | `{amount, responseWebhook, metadata}`      | `{status, clientSecret, transactionId}`                    |
-| `POST /mock/api/v1/register/request` | Request a payment method information register (server to server) | `{serviceName, responseWebhook, metadata}` | `{status, clientSecret}` + paymentToken via webhook        |
-| `POST /mock/deposit`                 | Deposit frontend (confirm transaction)                           | `{clientSecret}`                           | `{status, transactionId}`                                  |
-| `POST /mock/register`                | Register a payment method                                        | `{clientSecret}`                           | `{status}`                                                 |
-| `POST /mock/api/v1/withdraw`         | Make a withdraw to user's bank account (server to server)        | `{amount, gatewayToken, idempotencyKey}`   | `{status, transactionId}`                                  |
-| `GET /mock/api/v1/events`            | Get all events (simulated)                                       | \_                                         | `{events: [{id, name, description, status, teams, odds}]}` |
-| `GET /mock/api/v1/events/:id`        | Get event details (simulated)                                    | \_                                         | `{id, name, description, status, teams, odds}`             |
-| `GET /mock/api/v1/events/:id/odds`   | Get event odds (simulated)                                       | \_                                         | `{odds: [{team, value}]}`                                  |
-| `POST /mock/api/v1/events/subscribe` | Subcribe to update (new event, odds...) via webhook              | `{webhookUrl, metadata}`                   | `{status}`                                                 |
+| Endpoint                              | Description                                                      | Request                                    | Response                                                   |
+| ------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------- |
+| `POST /mock/api/v1/deposit/request`   | Request a deposit (server to server)                             | `{amount, responseWebhook, metadata}`      | `{status, clientSecret, transactionId}`                    |
+| `POST /mock/api/v1/register/request`  | Request a payment method information register (server to server) | `{serviceName, responseWebhook, metadata}` | `{status, clientSecret}` + paymentToken via webhook        |
+| `POST /mock/deposit`                  | Deposit frontend (confirm transaction)                           | `{clientSecret}`                           | `{status, transactionId}`                                  |
+| `POST /mock/register`                 | Register a payment method                                        | `{clientSecret}`                           | `{status}`                                                 |
+| `POST /mock/api/v1/withdraw`          | Make a withdraw to user's bank account (server to server)        | `{amount, gatewayToken, idempotencyKey}`   | `{status, transactionId}`                                  |
+| `GET /mock/api/v1/events`             | Get all events (simulated)                                       | \_                                         | `{events: [{id, name, description, status, teams, odds}]}` |
+| `GET /mock/api/v1/events/:id`         | Get event details (simulated)                                    | \_                                         | `{id, name, description, status, teams, odds}`             |
+| `GET /mock/api/v1/events/:id/odds`    | Get event odds (simulated)                                       | \_                                         | `{odds: [{team, value}]}`                                  |
+| `POST /mock/api/v1/events/subscribe`  | Subcribe to update (new event, odds...) via webhook              | `{webhookUrl, metadata}`                   | `{status}`                                                 |
+| `POST /mock/api/v1/events/add`        | Add an event (No implement)                                      | \_                                         | `{status}`                                                 |
+| `DELETE /mock/api/v1/events/:id`      | Delete an event (No implement)                                   | \_                                         | `{status}`                                                 |
+| `POST /mock/api/v1/events/:id/settle` | Settle an event (No implement)                                   | \_                                         | `{status}`                                                 |
 
 **\*** Mock payment gateway generates paymentToken via user information, accepts any request after user confirmation
 **\*** Mock events service will periodically randomly add new events, update existing ones, settle, update odds...
