@@ -10,7 +10,7 @@ pub mod webhook;
 pub use auth::*;
 pub use db::connect_pg;
 pub use events::*;
-pub use http::{req_get_request_id, req_get_user_role, req_user_match_id};
+pub use http::{req_get_request_id, req_get_user_id, req_get_user_role, req_user_match_id};
 pub use payment_gateway::*;
 pub use retry::*;
 pub use rmq::{

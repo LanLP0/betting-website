@@ -1,6 +1,9 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middleware::Logger, web};
 use actix_ws::Message;
-use betting_common::{NotificationPush, exchanges};
+use backon::{ExponentialBuilder, Retryable};
+use betting_common::{
+    NotificationPush, exchanges, http::req_get_user_id, req_get_user_role, req_user_match_id,
+};
 use futures_util::StreamExt;
 use lapin::{options::*, types::FieldTable};
 use redis::AsyncCommands;
@@ -16,11 +19,17 @@ struct AppState {
 }
 
 #[derive(Serialize)]
-struct NotificationResponse {
+struct NotificationsResponse {
+    user_id: Uuid,
+    total_count: i64,
+    notifications: Vec<UserNotification>,
+}
+
+#[derive(Serialize)]
+struct UserNotification {
     id: Uuid,
     notification_type: String,
     title: String,
-    message: String,
     payload: serde_json::Value,
     status: String,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -32,136 +41,302 @@ struct MarkReadReq {
     all: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct NotificationQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 async fn health_check() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
+/// Fetch notifications for a target user with RBAC enforcement and retry resilience.
 async fn get_user_notifications(
     req: HttpRequest,
     path: web::Path<Uuid>,
+    query: web::Query<NotificationQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let target_user_id = path.into_inner();
+    let auth_user_role = req_get_user_role(&req);
 
-    if !betting_common::req_user_match_id(&req, &target_user_id) {
+    // Enforce authorization: only the resource owner or an admin can view user notifications
+    if !req_user_match_id(&req, &target_user_id) && auth_user_role != "admin" {
         return HttpResponse::Forbidden().finish();
     }
 
-    let rows = sqlx::query!(
-        "SELECT id, notification_type, title, message, payload, status, created_at FROM notification_schema.user_notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
-        target_user_id
-    )
-    .fetch_all(&data.db)
-    .await
-    .unwrap_or_default();
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
 
-    let res: Vec<_> = rows
-        .into_iter()
-        .map(|r| NotificationResponse {
-            id: r.id,
-            notification_type: r.notification_type,
-            title: r.title,
-            message: r.message,
-            payload: r.payload,
-            status: r.status,
-            created_at: r.created_at,
+    let rows_res = {
+        || async {
+            sqlx::query!(
+                r#"
+                SELECT id, notification_type, title, payload, status, created_at 
+                FROM notification_schema.user_notifications 
+                WHERE user_id = $1 
+                ORDER BY created_at DESC 
+                LIMIT $2 OFFSET $3
+                "#,
+                target_user_id,
+                limit,
+                offset
+            )
+            .fetch_all(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    let count_res = {
+        || async {
+            sqlx::query!(
+                "SELECT COUNT(*) FROM notification_schema.user_notifications WHERE user_id = $1",
+                target_user_id
+            )
+            .fetch_one(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    if rows_res.is_ok() && count_res.is_ok() {
+        let (rows, count) = (rows_res.unwrap(), count_res.unwrap());
+        let res: Vec<_> = rows
+            .into_iter()
+            .map(|r| UserNotification {
+                id: r.id,
+                notification_type: r.notification_type,
+                title: r.title,
+                payload: r.payload,
+                status: r.status,
+                created_at: r.created_at,
+            })
+            .collect();
+        HttpResponse::Ok().json(NotificationsResponse {
+            user_id: target_user_id,
+            total_count: count.count.unwrap(),
+            notifications: res,
         })
-        .collect();
-
-    HttpResponse::Ok().json(res)
+    } else {
+        let e = rows_res.err().unwrap_or(count_res.err().unwrap());
+        log::error!("Database query failed in get_user_notifications: {:?}", e);
+        HttpResponse::InternalServerError().finish()
+    }
 }
 
+/// Mark notifications as read for a user (either all unread or selected IDs).
 async fn mark_notifications_read(
     req: HttpRequest,
     data: web::Data<AppState>,
     body: web::Json<MarkReadReq>,
 ) -> impl Responder {
-    let user_id_str = match req.headers().get("X-User-ID") {
-        Some(v) => v.to_str().unwrap_or(""),
-        None => return HttpResponse::Unauthorized().finish(),
-    };
-    let user_id = match Uuid::parse_str(user_id_str) {
-        Ok(id) => id,
-        Err(_) => return HttpResponse::BadRequest().finish(),
+    let user_id = match req_get_user_id(&req) {
+        Some(id) => id,
+        None => return HttpResponse::BadRequest().finish(),
     };
 
-    if body.all.unwrap_or(false) {
-        let _ = sqlx::query!(
-            "UPDATE notification_schema.user_notifications SET status = 'read', read_at = NOW() WHERE user_id = $1 AND status = 'unread'",
-            user_id
-        )
-        .execute(&data.db)
-        .await;
-    } else if let Some(ref ids) = body.notification_ids {
-        let _ = sqlx::query!(
-            "UPDATE notification_schema.user_notifications SET status = 'read', read_at = NOW() WHERE user_id = $1 AND id = ANY($2)",
-            user_id,
-            ids
-        )
-        .execute(&data.db)
-        .await;
+    let mark_all = body.all.unwrap_or(false);
+    let ids = body.notification_ids.as_deref().unwrap_or(&[]);
+
+    if !mark_all && ids.is_empty() {
+        return HttpResponse::BadRequest()
+            .body("Either 'all' must be true or 'notification_ids' provided with non-empty list");
     }
 
-    HttpResponse::Ok().finish()
+    let update_res = if mark_all {
+        {
+            || async {
+                sqlx::query!(
+                    "UPDATE notification_schema.user_notifications SET status = 'read', read_at = NOW() WHERE user_id = $1 AND status = 'unread'",
+                    user_id
+                )
+                .execute(&data.db)
+                .await
+            }
+        }
+        .retry(ExponentialBuilder::default().with_jitter())
+        .when(betting_common::sqlx_retry_when)
+        .await
+    } else {
+        {
+            || async {
+                sqlx::query!(
+                    "UPDATE notification_schema.user_notifications SET status = 'read', read_at = NOW() WHERE user_id = $1 AND id = ANY($2)",
+                    user_id,
+                    ids
+                )
+                .execute(&data.db)
+                .await
+            }
+        }
+        .retry(ExponentialBuilder::default().with_jitter())
+        .when(betting_common::sqlx_retry_when)
+        .await
+    };
+
+    match update_res {
+        Ok(_) => HttpResponse::Ok().finish(),
+        Err(e) => {
+            log::error!("Failed to mark notifications read: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        }
+    }
 }
 
+/*
+ * =========================================================================================
+ * ARCHITECTURAL NOTICE: REAL-TIME NOTIFICATION WORKER & SCALING DESIGN
+ * =========================================================================================
+ * Context & Scenario:
+ * In a distributed multi-node deployment (e.g. Docker Swarm / Kubernetes), WebSocket clients
+ * establish sticky TCP connections to arbitrary pod replicas.
+ *
+ * 1. Cross-Node Broadcast & Targeted Routing:
+ *    - Domain events published to Redis channels (`notifications:<user_id>` and `odds_broadcast`)
+ *      enable any worker node to deliver real-time messages to the connected client.
+ * 2. Async Non-Blocking Pub/Sub:
+ *    - MUST use asynchronous non-blocking Redis Pub/Sub (`redis::aio::PubSub`) rather than
+ *      synchronous `get_connection()` / `pubsub.get_message()`. Synchronous IO inside Tokio tasks
+ *      will starve the async runtime thread pool, causing total service denial under concurrent load.
+ * 3. Connection Teardown & Leak Prevention:
+ *    - Active WebSocket sessions and Redis subscriptions must be coordinated via `tokio::select!`
+ *      so that when a WebSocket connection drops (or heartbeat times out), the Redis subscription
+ *      is cleanly unregistered and the connection resource returned.
+ * 4. Future Enhancement (GAP / Scalability):
+ *    - Client ack/read synchronization: When a user marks notifications as read on Client A,
+ *      publish a `notification.read` event via Redis Pub/Sub to update badge counters in real-time
+ *      on Client B (multi-tab/multi-device synchronization).
+ * =========================================================================================
+ */
 async fn ws_notifications(
     req: HttpRequest,
     stream: web::Payload,
     data: web::Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user_id_str = req
-        .headers()
-        .get("X-User-ID")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let user_id = match Uuid::parse_str(user_id_str) {
-        Ok(id) => id,
-        Err(_) => return Ok(HttpResponse::Unauthorized().finish()),
+    let user_id = match req_get_user_id(&req) {
+        Some(id) => id,
+        None => return Ok(HttpResponse::Unauthorized().finish()),
     };
+
+    // TODO check for multiple connections per user and reject if exists
 
     let (res, mut session, mut msg_stream) = actix_ws::handle(&req, stream)?;
     let redis_client = data.redis.clone();
 
-    // Spawn Redis Pub/Sub listener for this user (targeted + broadcast)
-    let mut session_clone = session.clone();
+    // Spawn unified non-blocking async session handler with Redis Pub/Sub and heartbeat monitoring
     actix_web::rt::spawn(async move {
         let user_channel = format!("notifications:{}", user_id);
         let broadcast_channel = "odds_broadcast".to_string();
 
-        if let Ok(mut pubsub_conn) = redis_client.get_connection() {
-            let mut pubsub = pubsub_conn.as_pubsub();
-            if pubsub.subscribe(&user_channel).is_ok()
-                && pubsub.subscribe(&broadcast_channel).is_ok()
-            {
-                while let Ok(msg) = pubsub.get_message() {
-                    let payload_str: String = msg.get_payload().unwrap_or_default();
-                    if session_clone.text(payload_str).await.is_err() {
-                        break; // Client disconnected
-                    }
-                }
+        let mut pubsub_conn = match redis_client.get_async_pubsub().await {
+            Ok(ps) => ps,
+            Err(e) => {
+                log::error!(
+                    "Failed to obtain async Redis PubSub connection for user {}: {:?}",
+                    user_id,
+                    e
+                );
+                let _ = session.close(None).await;
+                return;
             }
-        }
-    });
+        };
 
-    // Spawn client ping/pong stream handler
-    actix_web::rt::spawn(async move {
-        while let Some(Ok(msg)) = msg_stream.next().await {
-            match msg {
-                Message::Ping(bytes) => {
-                    if session.pong(&bytes).await.is_err() {
-                        return;
+        if let Err(e) = pubsub_conn.subscribe(&user_channel).await {
+            log::error!(
+                "Failed to subscribe to user channel {}: {:?}",
+                user_channel,
+                e
+            );
+            let _ = session.close(None).await;
+            return;
+        }
+
+        if let Err(e) = pubsub_conn.subscribe(&broadcast_channel).await {
+            log::error!(
+                "Failed to subscribe to broadcast channel {}: {:?}",
+                broadcast_channel,
+                e
+            );
+            let _ = session.close(None).await;
+            return;
+        }
+
+        let mut pubsub_stream = pubsub_conn.into_on_message();
+
+        loop {
+            tokio::select! {
+                // Inbound WebSocket frames from client (ping, pong, close)
+                ws_msg = msg_stream.next() => {
+                    match ws_msg {
+                        Some(Ok(Message::Ping(bytes))) => {
+                            if session.pong(&bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            // Heartbeat response received
+                        }
+                        Some(Ok(Message::Close(reason))) => {
+                            let _ = session.close(reason).await;
+                            break;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => {
+                            // Client disconnected
+                            break;
+                        }
                     }
                 }
-                Message::Close(_) => break,
-                _ => (),
+                // Inbound Redis Pub/Sub messages (user targeted or broadcast)
+                redis_msg = pubsub_stream.next() => {
+                    match redis_msg {
+                        Some(msg) => {
+                            let payload_str: String = msg.get_payload().unwrap_or_default();
+                            if session.text(payload_str).await.is_err() {
+                                break; // Failed to deliver to WS client, teardown
+                            }
+                        }
+                        None => {
+                            // Redis Pub/Sub stream terminated
+                            break;
+                        }
+                    }
+                }
             }
         }
+
+        log::debug!(
+            "WebSocket notification session closed cleanly for user {}",
+            user_id
+        );
     });
 
     Ok(res)
 }
 
+/*
+ * =========================================================================================
+ * ARCHITECTURAL NOTICE: PERSISTENT NOTIFICATION CONSUMER & RESILIENCE
+ * =========================================================================================
+ * Context & Scenario:
+ * Consumes `notification.push` messages from RabbitMQ:
+ * 1. Batched / Transactional Persistence:
+ *    - User alerts are persisted to PostgreSQL (`notification_schema.user_notifications`).
+ *    - Transient database errors are retried using exponential backoff with jitter (`backon`).
+ * 2. Cross-Node Fanout:
+ *    - Once persisted, the message is fanned out across all active cluster nodes via Redis Pub/Sub.
+ * 3. Dead Letter Queue & Deduplication:
+ *    - If PostgreSQL or Redis remains permanently unavailable after maximum retries, messages
+ *      must be pushed to a Dead Letter Queue (DLQ: `notification.dlq`) with full trace headers
+ *      to avoid message loss or head-of-line blocking in the main queue.
+ * =========================================================================================
+ */
 async fn rmq_notification_consumer(
     pool: PgPool,
     rmq_chan: lapin::Channel,
@@ -200,26 +375,51 @@ async fn rmq_notification_consumer(
         .await
         .expect("Failed to create consumer");
 
+    // Acquire reusable multiplexed async connection for Redis publishing
+    let mut redis_conn_opt = redis_client.get_multiplexed_async_connection().await.ok();
+
     while let Some(delivery) = consumer.next().await {
         if let Ok(delivery) = delivery {
             if let Ok(notif) = serde_json::from_slice::<NotificationPush>(&delivery.data) {
-                // 1. Asynchronously persist to database
-                let _ = sqlx::query!(
-                    "INSERT INTO notification_schema.user_notifications (user_id, notification_type, title, message, payload) VALUES ($1, $2, $3, $4, $5)",
-                    notif.user_id,
-                    notif.notification_type,
-                    notif.title,
-                    notif.message,
-                    notif.payload
-                )
-                .execute(&pool)
+                // 1. Persist to database with exponential retry
+                let insert_res = {
+                    || async {
+                        sqlx::query!(
+                            "INSERT INTO notification_schema.user_notifications (user_id, notification_type, title, payload) VALUES ($1, $2, $3, $4)",
+                            notif.user_id,
+                            notif.notification_type,
+                            notif.title,
+                            notif.payload
+                        )
+                        .execute(&pool)
+                        .await
+                    }
+                }
+                .retry(ExponentialBuilder::default().with_jitter())
+                .when(betting_common::sqlx_retry_when)
                 .await;
 
+                if let Err(e) = insert_res {
+                    log::error!(
+                        "Failed to persist notification to DB after retries: {:?}",
+                        e
+                    );
+                    // TODO In a full production system, reject and route to DLQ
+                }
+
                 // 2. Publish to Redis Pub/Sub for active WebSocket sessions across nodes
-                if let Ok(mut r_conn) = redis_client.get_multiplexed_async_connection().await {
+                if redis_conn_opt.is_none() {
+                    redis_conn_opt = redis_client.get_multiplexed_async_connection().await.ok();
+                }
+
+                if let Some(ref mut r_conn) = redis_conn_opt {
                     let channel_name = format!("notifications:{}", notif.user_id);
                     let notif_json = serde_json::to_string(&notif).unwrap_or_default();
-                    let _: () = r_conn.publish(channel_name, notif_json).await.unwrap_or(());
+                    let pub_res: Result<(), _> = r_conn.publish(channel_name, notif_json).await;
+                    if let Err(e) = pub_res {
+                        log::warn!("Redis publish failed, resetting connection: {:?}", e);
+                        redis_conn_opt = None; // Reconnect on next iteration
+                    }
                 }
             }
             let _ = delivery.ack(BasicAckOptions::default()).await;
@@ -238,11 +438,11 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to postgres");
 
     let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
-    let rmq_chan = betting_common::connect_rmq(&rmq_url)
+    let rmq_chan = betting_common::connect_rmq(&rmq_url, "notification-service")
         .await
         .expect("Failed to connect to RabbitMQ");
 
-    rmq_chan
+    let _ = rmq_chan
         .exchange_declare(
             exchanges::NOTIFICATION.into(),
             lapin::ExchangeKind::Topic,

@@ -20,4 +20,3 @@ futures-util = "0.3.34"
 backon = "1.6.0"
 betting-common = { path = "../betting-common" }
 env_logger = "0.11"
-

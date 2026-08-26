@@ -2,15 +2,16 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middlewar
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
     Event, EventOdds, OddsRpcRequest, OddsRpcResponse, connect_pg, connect_rmq, exchanges,
-    publish_event_props, publish_event_with_trace, req_get_request_id, verify_hmac_signature,
+    get_odds_for_event, publish_event_props, publish_event_with_trace, req_get_request_id,
+    verify_hmac_signature,
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use futures_util::stream::StreamExt;
 use lapin::{BasicProperties, options::*, types::FieldTable};
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::env;
+use std::{env, time::Duration};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 struct AppState {
@@ -99,57 +100,11 @@ async fn get_event(path: web::Path<Uuid>, data: web::Data<AppState>) -> impl Res
 // Checked
 async fn get_event_odds(path: web::Path<Uuid>, data: web::Data<AppState>) -> impl Responder {
     let id = path.into_inner();
-    let redis_key = format!("odds:{}", id);
 
-    let mut conn = data.redis.get_multiplexed_async_connection().await.ok();
-
-    // 1. Try Redis cache
-    if let Some(ref mut c) = conn {
-        if let Ok(val) = c.get::<_, String>(&redis_key).await {
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val) {
-                return HttpResponse::Ok().json(json_val);
-            }
-        }
+    match get_odds_for_event(id, &data.db, &data.redis).await {
+        Some(event_odds) => HttpResponse::Ok().json(event_odds),
+        None => HttpResponse::NotFound().body("Event not found or odds currently unavailable"),
     }
-
-    // 2. Check if event exists in DB
-    let ev_req = {
-        || async {
-            sqlx::query!(
-                "SELECT status, winning_selection, teams, odds FROM events_schema.events WHERE id = $1",
-                id
-            )
-            .fetch_optional(&data.db)
-            .await
-        }
-    }
-    .retry(ExponentialBuilder::default().with_jitter())
-    .when(betting_common::sqlx_retry_when)
-    .await;
-
-    if let Ok(Some(ev)) = ev_req {
-        let odds_f = ev
-            .odds
-            .iter()
-            .map(|o| o.to_f64().unwrap_or_default())
-            .collect::<Vec<_>>();
-        let res_json = serde_json::json!(EventOdds {
-            event_id: id,
-            status: ev.status,
-            winning_selection: ev.winning_selection,
-            teams: ev.teams,
-            odds: odds_f
-        });
-
-        if let Some(mut c) = conn {
-            let payload_str = serde_json::to_string(&res_json).unwrap_or_default();
-            let _: () = c.set_ex(&redis_key, payload_str, 60).await.unwrap_or(());
-        }
-
-        return HttpResponse::Ok().json(res_json);
-    }
-
-    HttpResponse::NotFound().body("Event not found or odds currently unavailable")
 }
 
 // Checked
@@ -210,6 +165,7 @@ async fn events_callback(
     HttpResponse::Ok().finish()
 }
 
+// Checked
 // Background RPC responder for internal services querying event odds
 async fn rpc_odds_consumer(pool: PgPool, rmq: lapin::Channel, redis_client: redis::Client) {
     let q = rmq
@@ -243,56 +199,26 @@ async fn rpc_odds_consumer(pool: PgPool, rmq: lapin::Channel, redis_client: redi
             )
             .await
         {
-            while let Some(delivery) = consumer.next().await {
-                if let Ok(delivery) = delivery {
+            let mut retries = 0;
+            loop {
+                let delivery = consumer.next().await;
+                if delivery.is_none() {
+                    continue;
+                }
+
+                if let Some(Ok(delivery)) = delivery {
                     if let Ok(req) = serde_json::from_slice::<OddsRpcRequest>(&delivery.data) {
-                        let mut teams = vec!["Home Team".to_string(), "Away Team".to_string()];
-                        let mut odds = vec![1.90, 1.90];
-                        let mut success = false;
-
-                        let redis_key = format!("odds:{}", req.event_id);
-                        if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await
-                        {
-                            if let Ok(val) = conn.get::<_, String>(&redis_key).await {
-                                if let Ok(json_val) =
-                                    serde_json::from_str::<serde_json::Value>(&val)
-                                {
-                                    if let (Some(t), Some(o)) = (
-                                        json_val.get("teams").and_then(|t| t.as_array()),
-                                        json_val.get("odds").and_then(|o| o.as_array()),
-                                    ) {
-                                        teams = t
-                                            .iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect();
-                                        odds = o.iter().filter_map(|v| v.as_f64()).collect();
-                                        success = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        if !success {
-                            if let Ok(Some(_)) = sqlx::query!(
-                                "SELECT id FROM events_schema.events WHERE id = $1",
-                                req.event_id
-                            )
-                            .fetch_optional(&pool)
-                            .await
-                            {
-                                success = true;
-                            }
-                        }
-
                         if let (Some(reply_to), Some(corr_id)) = (
                             delivery.properties.reply_to().as_ref().map(|s| s.as_str()),
                             delivery.properties.correlation_id().as_ref(),
                         ) {
+                            let event_odds =
+                                get_odds_for_event(req.event_id, &pool, &redis_client).await;
+
                             let response = OddsRpcResponse {
                                 event_id: req.event_id,
-                                success,
-                                teams: Some(teams),
-                                odds: Some(odds),
+                                success: event_odds.is_some(),
+                                event_odds,
                             };
 
                             let props =
@@ -301,6 +227,14 @@ async fn rpc_odds_consumer(pool: PgPool, rmq: lapin::Channel, redis_client: redi
                         }
                     }
                     let _ = delivery.ack(BasicAckOptions::default()).await;
+                } else {
+                    // Failed
+                    if retries > 3 {
+                        panic!("rpc consumer retries exceed max times");
+                    }
+
+                    sleep(Duration::from_secs(1 * 3u64.pow(retries))).await;
+                    retries += 1;
                 }
             }
         }
@@ -316,7 +250,9 @@ async fn main() -> std::io::Result<()> {
     let pool = connect_pg(&db_url, 5).await.expect("Failed DB connection");
 
     let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
-    let rmq_chan = connect_rmq(&rmq_url).await.expect("Failed RMQ connection");
+    let rmq_chan = connect_rmq(&rmq_url, "events-service")
+        .await
+        .expect("Failed RMQ connection");
 
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL required");
     let redis_client = redis::Client::open(redis_url).expect("Failed Redis connection");

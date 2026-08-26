@@ -1,3 +1,4 @@
+use lapin::ErrorKind as LapinErrorKind;
 use reqwest::{Error as ReqwestError, StatusCode};
 use sqlx::Error as SqlxError;
 
@@ -25,4 +26,13 @@ pub fn reqwest_http_retry_when(e: &ReqwestError) -> bool {
     }
 
     return false;
+}
+
+pub fn lapin_retry_when(e: &lapin::Error) -> bool {
+    match e.kind() {
+        LapinErrorKind::InvalidChannelState(..) => true,
+        LapinErrorKind::InvalidConnectionState(..) => true,
+        LapinErrorKind::IOError(..) => true,
+        _ => false,
+    }
 }

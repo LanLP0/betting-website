@@ -1,12 +1,13 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middleware::Logger, web};
+use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
     BetCancelled, BetRequested, BetWon, EventSettled, NotificationPush, WalletStatus, connect_pg,
-    connect_rmq, exchanges, publish_event, publish_event_with_trace, req_get_request_id,
+    connect_rmq, exchanges, get_odds_for_event, publish_event, publish_event_with_trace,
+    req_get_request_id,
 };
-use bigdecimal::ToPrimitive;
+use bigdecimal::{FromPrimitive, RoundingMode, ToPrimitive};
 use futures_util::stream::StreamExt;
 use lapin::{options::*, types::FieldTable};
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, types::BigDecimal};
 use std::collections::HashMap;
@@ -53,25 +54,64 @@ struct EventBetsMetricsResponse {
     bets_by_selection: Vec<SelectionMetrics>,
 }
 
+// Checked
 async fn handle_wallet_status(
     pool: &PgPool,
     rmq: &lapin::Channel,
     event: WalletStatus,
     _delivery: &lapin::message::Delivery,
 ) {
+    let bet_status = {
+        || async {
+            sqlx::query!(
+                "SELECT status FROM bets_schema.bets WHERE id = $1",
+                event.bet_id
+            )
+            .fetch_optional(pool)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    if bet_status.is_err() {
+        // TODO push event back into dead letter queue
+        return;
+    }
+
+    let bet_status = bet_status.unwrap();
+
+    if bet_status.is_none() {
+        if event.status == "SUCCESS" {
+            // TODO refund here
+        }
+        return;
+    }
+
+    let s = bet_status.unwrap().status;
     let status = if event.status == "SUCCESS" {
-        "CONFIRMED"
+        match s.as_str() {
+            "PENDING-LOST" => "LOST", // When the event is settled before wallet respond
+            "PENDING-WON" => "WON",
+            "PENDING" => "CONFIRMED",
+            _ => unreachable!(), // Possible scenario: wallet status event is fired twice (shouldn't happen due to RMQ message acknowledgement)
+        }
     } else {
         "FAILED"
     };
 
-    let bet = sqlx::query!(
+    if status == "WON" {
+        // TODO payout here - push bet.won event
+    }
+
+    let bet = {|| async {sqlx::query!(
         "UPDATE bets_schema.bets SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING user_id, amount, selection",
         status,
         event.bet_id
     )
     .fetch_optional(pool)
-    .await;
+    .await}}.retry(ExponentialBuilder::default().with_jitter()).when(betting_common::sqlx_retry_when).await;
 
     if let Ok(Some(row)) = bet {
         let user_id: Uuid = row.user_id;
@@ -81,61 +121,83 @@ async fn handle_wallet_status(
                 user_id,
                 notification_type: "bet_confirmed".into(),
                 title: "Bet Confirmed".into(),
-                message: format!("Your bet on '{}' has been placed successfully.", selection),
-                payload: serde_json::json!({ "bet_id": event.bet_id }),
+                payload: serde_json::json!({ "content": [{"type": "text", "text": format!("Your bet on '{}' has been placed successfully.", selection)}], "metadata": {"bet_id": event.bet_id} }),
             };
             let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
+        } else {
+            // TODO notification
         }
     }
 }
 
+// Checked
 async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventSettled) {
     let winning = event.winning_selection.clone();
 
-    let _ = sqlx::query!(
-        "UPDATE bets_schema.bets SET status = 'WON', updated_at = NOW() WHERE event_id = $1 AND selection = $2 AND status = 'CONFIRMED'",
-        event.event_id,
-        winning
-    )
-    .execute(pool)
+    let res = {
+        || async {
+            sqlx::query!(
+                r#"
+                UPDATE bets_schema.bets 
+                SET 
+                    status = CASE 
+                        WHEN status = 'CONFIRMED' AND selection = $2 THEN 'WON'
+                        WHEN status = 'CONFIRMED' AND selection != $2 THEN 'LOST'
+                        WHEN status = 'PENDING' AND selection = $2 THEN 'PENDING-WON'
+                        WHEN status = 'PENDING' AND selection != $2 THEN 'PENDING-LOST'
+                        ELSE status 
+                    END,
+                    updated_at = NOW()
+                WHERE event_id = $1 
+                AND status IN ('CONFIRMED', 'PENDING')
+                RETURNING id, user_id, amount, odds_at_placement, status
+                "#,
+                event.event_id,
+                winning
+            )
+            .fetch_all(pool)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
     .await;
 
-    let _ = sqlx::query!(
-        "UPDATE bets_schema.bets SET status = 'LOST', updated_at = NOW() WHERE event_id = $1 AND selection != $2 AND status = 'CONFIRMED'",
-        event.event_id,
-        winning
-    )
-    .execute(pool)
-    .await;
+    if res.is_err() {
+        return;
+    }
 
-    let won_bets = sqlx::query!(
-        "SELECT id, user_id, amount, odds_at_placement FROM bets_schema.bets WHERE event_id = $1 AND status = 'WON'",
-        event.event_id
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let updated_bets = res.unwrap();
 
-    for bet in won_bets {
+    for bet in updated_bets {
+        if bet.status != "WON" {
+            // TODO notification for LOST
+            continue;
+        }
+
         let bet_id: Uuid = bet.id;
         let user_id: Uuid = bet.user_id;
         let amount: BigDecimal = bet.amount;
         let odds: BigDecimal = bet.odds_at_placement;
+        let payout = amount * odds;
 
-        let amt_f = amount.to_f64().unwrap_or(0.0);
-        let odds_f = odds.to_f64().unwrap_or(1.0);
-        let payout = amt_f * odds_f;
+        let payout_f = payout
+            .with_scale_round(4, RoundingMode::HalfEven)
+            .to_f64()
+            .unwrap_or(0.0);
 
         let event_msg = BetWon {
             bet_id,
             user_id,
-            payout_amount: payout,
+            payout_amount: payout_f,
+            payout_amount_full: payout.to_plain_string(),
         };
 
         let _ = publish_event(rmq, exchanges::BETTING, "bet.won", event_msg).await;
     }
 }
 
+// Checked
 async fn handle_bet_cancel_refunded(pool: &PgPool, event: WalletStatus) {
     if event.status == "SUCCESS" {
         let _ = sqlx::query!(
@@ -144,6 +206,8 @@ async fn handle_bet_cancel_refunded(pool: &PgPool, event: WalletStatus) {
         )
         .execute(pool)
         .await;
+
+        // TODO refund notification
     }
 }
 
@@ -151,6 +215,7 @@ async fn get_health() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
+// Checked
 async fn place_bet(
     req: HttpRequest,
     data: web::Data<AppState>,
@@ -169,31 +234,17 @@ async fn place_bet(
         return HttpResponse::BadRequest().body("Invalid bet amount");
     }
 
-    // Read odds from Redis
-    let redis_key = format!("odds:{}", body.event_id);
-    let mut current_odds: Option<f64> = None;
+    let odds = get_odds_for_event(body.event_id, &data.db, &data.redis).await;
 
-    if let Ok(mut conn) = data.redis.get_multiplexed_async_connection().await {
-        if let Ok(val) = conn.get::<_, String>(&redis_key).await {
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val) {
-                if let Some(teams) = json_val.get("teams").and_then(|t| t.as_array()) {
-                    if let Some(odds) = json_val.get("odds").and_then(|o| o.as_array()) {
-                        for (idx, team_val) in teams.iter().enumerate() {
-                            if team_val.as_str() == Some(&body.selection) {
-                                if let Some(odd_num) = odds.get(idx).and_then(|o| o.as_f64()) {
-                                    current_odds = Some(odd_num);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if odds.is_none() {
+        return HttpResponse::BadRequest().body("Odds for event/selection not available");
     }
 
-    let odds_val = match current_odds {
-        Some(o) => o,
+    let odds = odds.unwrap();
+    let i = odds.teams.iter().position(|t| t == &body.selection);
+
+    let odd_val = match i {
+        Some(i) => odds.odds[i],
         None => return HttpResponse::BadRequest().body("Odds for event/selection not available"),
     };
 
@@ -201,23 +252,19 @@ async fn place_bet(
         Ok(a) => a,
         Err(_) => return HttpResponse::BadRequest().body("Invalid decimal amount"),
     };
-    let odds_dec = match BigDecimal::try_from(odds_val) {
-        Ok(o) => o,
-        Err(_) => return HttpResponse::BadRequest().body("Invalid odds value"),
-    };
     let bet_id = Uuid::new_v4();
 
-    let query = sqlx::query!(
+    let query = {|| async {sqlx::query!(
         "INSERT INTO bets_schema.bets (id, user_id, event_id, selection, odds_at_placement, amount, status) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')",
         bet_id,
         user_id,
         body.event_id,
         body.selection,
-        odds_dec,
+        BigDecimal::from_f64(odd_val),
         amount_dec
     )
     .execute(&data.db)
-    .await;
+    .await}}.retry(ExponentialBuilder::default().with_jitter()).when(betting_common::sqlx_retry_when).await;
 
     if query.is_err() {
         return HttpResponse::InternalServerError().finish();
@@ -240,11 +287,19 @@ async fn place_bet(
     .await
     .is_err()
     {
-        let _ = sqlx::query!(
-            "UPDATE bets_schema.bets SET status = 'FAILED' WHERE id = $1",
-            bet_id
-        )
-        .execute(&data.db)
+        // TODO handle SQL failure via dead letter queue
+        let _ = {
+            || async {
+                sqlx::query!(
+                    "UPDATE bets_schema.bets SET status = 'FAILED' WHERE id = $1",
+                    bet_id
+                )
+                .execute(&data.db)
+                .await
+            }
+        }
+        .retry(ExponentialBuilder::default().with_jitter())
+        .when(betting_common::sqlx_retry_when)
         .await;
         return HttpResponse::InternalServerError().body("Failed to queue bet");
     }
@@ -404,7 +459,9 @@ async fn main() -> std::io::Result<()> {
     let pool = connect_pg(&db_url, 5).await.expect("Failed DB connection");
 
     let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
-    let rmq_chan = connect_rmq(&rmq_url).await.expect("Failed RMQ connection");
+    let rmq_chan = connect_rmq(&rmq_url, "betting-service")
+        .await
+        .expect("Failed RMQ connection");
 
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL required");
     let redis_client = redis::Client::open(redis_url).expect("Failed Redis connection");

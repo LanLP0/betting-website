@@ -21,4 +21,5 @@ hmac = "0.13"
 sha2 = "0.11"
 betting-common = { path = "../betting-common" }
 reqwest = { version = "0.13", features = ["json"] }
+log = "0.4"
 env_logger = "0.11"

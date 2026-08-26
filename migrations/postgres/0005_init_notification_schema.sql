@@ -13,8 +13,7 @@ CREATE TABLE IF NOT EXISTS notification_schema.user_notifications (
     user_id UUID NOT NULL,
     notification_type VARCHAR(50) NOT NULL DEFAULT 'system',
     title VARCHAR(255) NOT NULL,
-    message TEXT NOT NULL,
-    payload JSONB NOT NULL DEFAULT '{}', -- Rich context: {"bet_id": "...", "event_id": "...", "action": "view_bet"}
+    payload JSONB NOT NULL DEFAULT '{}', -- Notification content: {"content": [{type, ...}], ...} (type is text, image, video, action)
     status VARCHAR(50) NOT NULL DEFAULT 'unread', -- unread, read
     read_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP

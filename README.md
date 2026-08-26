@@ -26,8 +26,5 @@ For a full specification of this project, see [specs.md](specs.md).
 - [x] Swarm deployment script cleanup (`deploy-swarm.sh` drops previous stack)
 - [x] Server-wide request tracing (`X-Request-ID` / `X-Trace-ID` propagation)
 - [x] Complete OpenAPI / Swagger UI specs for management service
-- [ ] Zero trust: internal mTLS / secret verification
 - [ ] Comprehensive unit and integration test suite
 - [ ] Frontend React client (Planned for future phase)
-
-

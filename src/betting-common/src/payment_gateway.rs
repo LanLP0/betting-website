@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepositRequest {
+    pub service_token: String,
     pub user_id: Option<Uuid>,
     pub amount: f64,
     pub response_webhook: String,
@@ -18,19 +19,35 @@ pub struct DepositResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
-    pub service_name: String,
+pub struct DepositWebhookResponse {
+    pub transaction_id: Uuid,
+    pub user_id: Uuid,
+    pub amount: f64,
+    pub amount_full: String, // BigDecimal
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterPaymentInfoRequest {
+    pub service_token: String,
     pub response_webhook: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterResponse {
+pub struct RegisterPaymentInfoResponse {
     pub status: String,
     pub client_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterPaymentInfoWebhookResponse {
+    pub payment_token: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawRequest {
+    pub service_token: String,
     pub user_id: Option<Uuid>,
     pub amount: f64,
     pub gateway_token: String,
@@ -43,17 +60,16 @@ pub struct WithdrawResponse {
     pub transaction_id: Uuid,
 }
 
-/// Abstract Payment Gateway Trait for decoupling financial transactions from specific providers/mocks
 pub trait PaymentGateway: Send + Sync {
     fn request_deposit<'a>(
         &'a self,
         req: DepositRequest,
     ) -> Pin<Box<dyn Future<Output = Result<DepositResponse, String>> + Send + 'a>>;
 
-    fn request_registration<'a>(
+    fn request_payment_info_registration<'a>(
         &'a self,
-        req: RegisterRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<RegisterResponse, String>> + Send + 'a>>;
+        req: RegisterPaymentInfoRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RegisterPaymentInfoResponse, String>> + Send + 'a>>;
 
     fn withdraw<'a>(
         &'a self,

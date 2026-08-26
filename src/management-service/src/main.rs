@@ -448,7 +448,9 @@ async fn main() -> std::io::Result<()> {
     let pool = connect_pg(&db_url, 5).await.expect("Failed DB connection");
 
     let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
-    let rmq_chan = connect_rmq(&rmq_url).await.expect("Failed RMQ connection");
+    let rmq_chan = connect_rmq(&rmq_url, "management-service")
+        .await
+        .expect("Failed RMQ connection");
 
     let clickhouse_url =
         env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".into());

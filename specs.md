@@ -176,6 +176,7 @@ API specs are displayed with Swagger UI at `/api/swagger` (hosted by Management 
 | Wallet Service       | `GET /api/v1/wallet/:id`                    | Get wallet balance for user id                               | Bearer JWT                           |
 | Wallet Service       | `POST /api/v1/wallet/:id/deposit`           | Request to deposit funds (via payment gateway)               | Bearer JWT                           |
 | Wallet Service       | `POST /api/v1/wallet/:id/withdraw`          | Request to withdraw funds (via payment gateway)              | Bearer JWT                           |
+| Wallet Service       | `POST /api/v1/wallet/:id/register`          | Request payment method registration (via payment gateway)    | Bearer JWT                           |
 | Wallet Service       | `POST /api/v1/wallet/:id/callback/payment`  | Callback from payment gateway to confirm payment request     | Client Secret (attached in metadata) |
 | Wallet Service       | `POST /api/v1/wallet/:id/callback/register` | Callback from payment gateway to confirm payment request     | Client Secret (attached in metadata) |
 | Event Service        | `GET /api/v1/events`                        | Get all events                                               | \_                                   |

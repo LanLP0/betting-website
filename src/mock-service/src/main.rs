@@ -1,10 +1,15 @@
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, web};
 use backon::{ExponentialBuilder, Retryable};
-use betting_common::EventOdds;
+use betting_common::{
+    DepositRequest, DepositResponse, DepositWebhookResponse, EventOdds, RegisterPaymentInfoRequest,
+    RegisterPaymentInfoResponse, RegisterPaymentInfoWebhookResponse, WithdrawRequest,
+    WithdrawResponse, http::BadRequestResponse,
+};
 use bigdecimal::{RoundingMode, ToPrimitive};
+use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::Sha256;
 use sqlx::{PgPool, types::BigDecimal};
 use std::{
@@ -58,32 +63,6 @@ impl AppState {
 
 // Request & Response DTOs
 #[derive(Deserialize)]
-struct DepositRequestReq {
-    user_id: Option<Uuid>,
-    amount: f64,
-    response_webhook: String,
-}
-
-#[derive(Serialize)]
-struct DepositRequestRes {
-    status: String,
-    client_secret: String,
-    transaction_id: Uuid,
-}
-
-#[derive(Deserialize)]
-struct RegisterRequestReq {
-    service_name: String,
-    response_webhook: String,
-}
-
-#[derive(Serialize)]
-struct RegisterRequestRes {
-    status: String,
-    client_secret: String,
-}
-
-#[derive(Deserialize)]
 struct ConfirmDepositReq {
     client_secret: String,
 }
@@ -91,21 +70,6 @@ struct ConfirmDepositReq {
 #[derive(Deserialize)]
 struct ConfirmRegisterReq {
     client_secret: String,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct WithdrawReq {
-    amount: f64,
-    gateway_token: String,
-    idempotency_key: String,
-    user_id: Option<Uuid>,
-}
-
-#[derive(Serialize)]
-struct WithdrawRes {
-    status: String,
-    transaction_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -200,7 +164,7 @@ async fn health_check() -> impl Responder {
 // Checked
 async fn deposit_request(
     data: web::Data<AppState>,
-    body: web::Json<DepositRequestReq>,
+    body: web::Json<DepositRequest>,
 ) -> impl Responder {
     if let Some(res) = data.apply_chaos().await {
         return res;
@@ -215,30 +179,21 @@ async fn deposit_request(
     };
     let secret = data.default_webhook_secret.clone();
 
-    if let Ok(mut tx) = data.db.begin().await {
-        let _ = sqlx::query!(
-                "INSERT INTO mock_schema.deposit_requests (id, user_id, amount, client_secret, status) VALUES ($1, $2, $3, $4, 'pending')",
-                transaction_id, user_id, amount, client_secret
-            )
-            .execute(&mut *tx)
-            .await;
+    let res = {|| async{sqlx::query!(
+            "INSERT INTO mock_schema.deposit_requests (id, user_id, amount, client_secret, webhook_url, webhook_secret, expire_at, status) VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '10 minute', 'pending')",
+            transaction_id, user_id, amount, client_secret, body.response_webhook, secret
+        )
+        .execute(&data.db)
+        .await}}
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
-        let _ = sqlx::query!(
-                "INSERT INTO mock_schema.webhook_secrets (service_name, webhook_url, secret) VALUES ($1, $2, $3) ON CONFLICT (service_name) DO UPDATE SET webhook_url = EXCLUDED.webhook_url, secret = EXCLUDED.secret",
-                format!("deposit-{}", client_secret), &body.response_webhook, &secret
-            )
-            .execute(&mut *tx)
-            .await;
-
-        let res = tx.commit().await;
-        if res.is_err() {
-            return HttpResponse::InternalServerError().finish();
-        }
-    } else {
+    if res.is_err() {
         return HttpResponse::InternalServerError().finish();
     }
 
-    HttpResponse::Ok().json(DepositRequestRes {
+    HttpResponse::Ok().json(DepositResponse {
         status: "pending".into(),
         client_secret,
         transaction_id,
@@ -246,9 +201,9 @@ async fn deposit_request(
 }
 
 // Checked
-async fn register_request(
+async fn register_payment_info_request(
     data: web::Data<AppState>,
-    body: web::Json<RegisterRequestReq>,
+    body: web::Json<RegisterPaymentInfoRequest>,
 ) -> impl Responder {
     if let Some(res) = data.apply_chaos().await {
         return res;
@@ -260,8 +215,8 @@ async fn register_request(
     let res = {
         || async {
             sqlx::query!(
-                "INSERT INTO mock_schema.webhook_secrets (service_name, webhook_url, secret) VALUES ($1, $2, $3) ON CONFLICT (service_name) DO UPDATE SET webhook_url = EXCLUDED.webhook_url, secret = EXCLUDED.secret",
-                &body.service_name, &body.response_webhook, &secret
+                "INSERT INTO mock_schema.payment_info_requests (client_secret, webhook_url, webhook_secret, expire_at) VALUES ($1, $2, $3, NOW() + INTERVAL '10 minute')",
+                &client_secret, &body.response_webhook, &secret
             )
             .execute(&data.db)
             .await
@@ -275,7 +230,7 @@ async fn register_request(
         return HttpResponse::InternalServerError().finish();
     }
 
-    HttpResponse::Ok().json(RegisterRequestRes {
+    HttpResponse::Ok().json(RegisterPaymentInfoResponse {
         status: "pending".into(),
         client_secret,
     })
@@ -292,7 +247,7 @@ async fn confirm_deposit(
 
     let dep_req = {|| async {
         sqlx::query!(
-            "SELECT id, user_id, amount, status FROM mock_schema.deposit_requests WHERE client_secret = $1",
+            "SELECT id, user_id, amount, status, webhook_url, webhook_secret, expire_at FROM mock_schema.deposit_requests WHERE client_secret = $1",
             &body.client_secret
         )
         .fetch_optional(&data.db)
@@ -309,17 +264,27 @@ async fn confirm_deposit(
         }
     };
 
-    let secret_row = sqlx::query!(
-        "SELECT webhook_url, secret FROM mock_schema.webhook_secrets WHERE service_name = $1",
-        format!("deposit-{}", body.client_secret)
-    )
-    .fetch_optional(&data.db)
-    .await;
+    if dep.expire_at < Utc::now() {
+        let res = {|| async {
+            sqlx::query!(
+                "UPDATE mock_schema.deposit_requests SET status = 'failed' WHERE client_secret = $1",
+                &body.client_secret
+            )
+            .execute(&data.db)
+            .await
+        }}
+        .retry(ExponentialBuilder::default().with_jitter())
+        .when(betting_common::sqlx_retry_when).await;
 
-    let s = match secret_row {
-        Ok(Some(s)) => s,
-        _ => return HttpResponse::InternalServerError().finish(),
-    };
+        if res.is_err() {
+            log::info!(
+                "Failed to update deposit request status to failed (id: {})",
+                &dep.id
+            );
+        }
+
+        return HttpResponse::BadRequest().body("Reqest expired");
+    }
 
     let res = {
         || async {
@@ -343,18 +308,16 @@ async fn confirm_deposit(
     let user_id: Uuid = dep.user_id;
     let amount: BigDecimal = dep.amount.with_scale_round(4, RoundingMode::HalfEven);
 
-    let webhook_url: String = s.webhook_url;
-    let secret: String = s.secret;
-    let amount_f = amount.to_f64().unwrap_or(0.0);
-    let amount_s = amount.to_plain_string();
+    let webhook_url: String = dep.webhook_url;
+    let secret: String = dep.webhook_secret;
 
-    let payload = serde_json::json!({
-        "transaction_id": id,
-        "user_id": user_id,
-        "amount": amount_f,
-        "amount_full": amount_s,
-        "status": "SUCCESS"
-    });
+    let payload = DepositWebhookResponse {
+        transaction_id: id,
+        user_id,
+        amount: amount.to_f64().unwrap_or(0.0),
+        amount_full: amount.to_plain_string(),
+        status: "SUCCESS".into(),
+    };
 
     tokio::spawn(dispatch_webhook(
         data.http_client.clone(),
@@ -362,7 +325,7 @@ async fn confirm_deposit(
         webhook_url,
         secret,
         "deposit.confirmed".into(),
-        payload,
+        serde_json::to_value(payload).unwrap(),
         data.webhook_timeout_rate,
     ));
 
@@ -381,62 +344,87 @@ async fn confirm_register(
     }
 
     let token = format!("pm_tok_{}", Uuid::new_v4());
-    let _ = sqlx::query!(
+    let res = {|| async {sqlx::query!(
         "INSERT INTO mock_schema.payment_information (token, account_number, account_name, bank_name, bank_code) VALUES ($1, '1234567890', 'Mock Account', 'Test Bank', 'TEST01')",
         &token
     )
     .execute(&data.db)
+    .await}}
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
     .await;
 
+    if res.is_err() {
+        return HttpResponse::InternalServerError().finish();
+    }
+
     // Send callback to subscriber if client_secret registered
-    let secret_row = sqlx::query!(
-        "SELECT webhook_url, secret FROM mock_schema.webhook_secrets WHERE service_name = $1",
-        &body.client_secret
-    )
-    .fetch_optional(&data.db)
+    let secret_row = {|| async {
+        sqlx::query!(
+            "SELECT webhook_url, webhook_secret, expire_at FROM mock_schema.payment_info_requests WHERE client_secret = $1",
+            &body.client_secret
+        )
+        .fetch_optional(&data.db)
+        .await
+    }}
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
     .await;
 
     if let Ok(Some(s)) = secret_row {
-        let payload = serde_json::json!({
-            "status": "SUCCESS",
-            "payment_token": token
-        });
+        if s.expire_at < Utc::now() {
+            return HttpResponse::BadRequest().body("Reqest expired");
+        }
+
+        let payload = serde_json::to_value(RegisterPaymentInfoWebhookResponse {
+            payment_token: token,
+            status: "SUCCESS".into(),
+        })
+        .unwrap();
 
         tokio::spawn(dispatch_webhook(
             data.http_client.clone(),
             data.db.clone(),
             s.webhook_url,
-            s.secret,
+            s.webhook_secret,
             "payment.registered".into(),
-            payload,
+            payload.clone(),
             data.webhook_timeout_rate,
         ));
+
+        return HttpResponse::Ok().json(payload);
     }
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "SUCCESS",
-        "payment_token": token
-    }))
+    return HttpResponse::BadRequest().body("Payment information registration not found");
 }
 
 // Checked
-async fn withdraw(data: web::Data<AppState>, body: web::Json<WithdrawReq>) -> impl Responder {
+async fn withdraw(data: web::Data<AppState>, body: web::Json<WithdrawRequest>) -> impl Responder {
     if let Some(res) = data.apply_chaos().await {
         return res;
     }
 
     if body.amount <= 0.0 || body.gateway_token.is_empty() {
-        return HttpResponse::BadRequest().body("Invalid withdrawal parameters");
+        return HttpResponse::BadRequest().json(BadRequestResponse {
+            status: "failed".to_string(),
+            err_code: "invalid_params".to_string(),
+            should_retry: false,
+            msg: Some("Invalid withdrawal parameters".to_string()),
+        });
     }
 
     // Check idempotency store first
-    if let Ok(Some(cached)) = sqlx::query!(
+    let cached_res = {|| async {sqlx::query!(
         "SELECT response_status_code, response_body FROM mock_schema.idempotency_keys WHERE idempotency_key = $1",
         &body.idempotency_key
     )
     .fetch_optional(&data.db)
-    .await
-    {
+    .await}}
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
+
+    if let Ok(Some(cached)) = cached_res {
         let code: i32 = cached.response_status_code;
         let body_val: serde_json::Value = cached.response_body;
         return HttpResponse::build(actix_web::http::StatusCode::from_u16(code as u16).unwrap())
@@ -444,12 +432,13 @@ async fn withdraw(data: web::Data<AppState>, body: web::Json<WithdrawReq>) -> im
     }
 
     let transaction_id = Uuid::new_v4();
-    let res_body = serde_json::json!({
-        "status": "SUCCESS",
-        "transaction_id": transaction_id
-    });
+    let res_body = serde_json::to_value(&WithdrawResponse {
+        transaction_id,
+        status: "SUCCESS".into(),
+    })
+    .unwrap();
 
-    let _ = {
+    let res = {
         || async {
             sqlx::query!(
                 "INSERT INTO mock_schema.idempotency_keys (idempotency_key, response_status_code, response_body) VALUES ($1, 200, $2)",
@@ -463,12 +452,13 @@ async fn withdraw(data: web::Data<AppState>, body: web::Json<WithdrawReq>) -> im
     .retry(ExponentialBuilder::default().with_jitter())
     .when(betting_common::sqlx_retry_when).await;
 
-    // TODO what should we do if SQL failed?
+    if res.is_err() {
+        HttpResponse::InternalServerError().finish();
+    }
 
-    HttpResponse::Ok().json(WithdrawRes {
-        status: "SUCCESS".into(),
-        transaction_id,
-    })
+    // Real world transaction with Bank API happens here
+
+    HttpResponse::Ok().json(res_body)
 }
 
 // Checked
@@ -843,7 +833,7 @@ async fn main() -> std::io::Result<()> {
             )
             .route(
                 "/mock/api/v1/register/request",
-                web::post().to(register_request),
+                web::post().to(register_payment_info_request),
             )
             .route("/mock/deposit", web::post().to(confirm_deposit))
             .route("/mock/register", web::post().to(confirm_register))

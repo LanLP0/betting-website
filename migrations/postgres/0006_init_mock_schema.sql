@@ -16,6 +16,18 @@ CREATE TABLE IF NOT EXISTS mock_schema.deposit_requests (
     amount DECIMAL(19, 4) NOT NULL,
     client_secret VARCHAR(255) NOT NULL UNIQUE, -- Lookup key for user confirmation
     status VARCHAR(50) NOT NULL DEFAULT 'pending', -- pending, confirmed, expired
+    webhook_url TEXT NOT NULL,
+    webhook_secret VARCHAR(255) NOT NULL, -- HMAC-SHA256 secret
+    expire_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS mock_schema.payment_info_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_secret VARCHAR(255) NOT NULL UNIQUE, -- e.g. 'wallet-service', 'events-service'
+    webhook_url TEXT NOT NULL,
+    webhook_secret VARCHAR(255) NOT NULL, -- HMAC-SHA256 secret
+    expire_at TIMESTAMP WITH TIME ZONE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
