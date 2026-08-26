@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE events_schema.events \n                SET status = 'SETTLED', winning_selection = $1, settled_at = NOW() \n                WHERE id = $2 AND status != 'SETTLED'\n                RETURNING id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1aaceed401e3acb5c8e7db2dc23d08b7923bd0d80e5683b2bd80fdb4a69e10e3"
+}

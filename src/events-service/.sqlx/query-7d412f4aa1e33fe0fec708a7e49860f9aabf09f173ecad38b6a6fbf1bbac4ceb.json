@@ -1,26 +1,37 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT teams, odds FROM mock_schema.events WHERE id = $1",
+  "query": "SELECT status, teams, odds FROM events_schema.events WHERE id = $1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "teams",
-        "type_info": "TextArray",
+        "name": "status",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
-            "name": "teams"
+            "table": "events_schema.events",
+            "name": "status"
           }
         }
       },
       {
         "ordinal": 1,
+        "name": "teams",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "teams"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
         "name": "odds",
         "type_info": "NumericArray",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
+            "table": "events_schema.events",
             "name": "odds"
           }
         }
@@ -33,8 +44,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "5d115277c05574aa03f6cfcb3b1dd5ca56c1a322dd9ab591de5310777ac00ac5"
+  "hash": "7d412f4aa1e33fe0fec708a7e49860f9aabf09f173ecad38b6a6fbf1bbac4ceb"
 }

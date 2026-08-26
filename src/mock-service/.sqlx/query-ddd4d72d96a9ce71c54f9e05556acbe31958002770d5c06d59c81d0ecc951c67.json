@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mock_schema.payment_info_requests (client_secret, webhook_url, webhook_secret, expire_at) VALUES ($1, $2, $3, NOW() + INTERVAL '10 minute')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ddd4d72d96a9ce71c54f9e05556acbe31958002770d5c06d59c81d0ecc951c67"
+}

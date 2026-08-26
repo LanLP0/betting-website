@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, user_id, event_id, selection, odds_at_placement, amount, status, created_at FROM bets_schema.bets WHERE user_id = $1 ORDER BY created_at DESC",
+  "query": "\n                UPDATE bets_schema.bets \n                SET \n                    status = CASE \n                        WHEN status = 'CONFIRMED' AND selection = $2 THEN 'WON'\n                        WHEN status = 'CONFIRMED' AND selection != $2 THEN 'LOST'\n                        WHEN status = 'PENDING' AND selection = $2 THEN 'PENDING-WON'\n                        WHEN status = 'PENDING' AND selection != $2 THEN 'PENDING-LOST'\n                        ELSE status \n                    END,\n                    updated_at = NOW()\n                WHERE event_id = $1 \n                AND status IN ('CONFIRMED', 'PENDING')\n                RETURNING id, user_id, amount, odds_at_placement, status\n                ",
   "describe": {
     "columns": [
       {
@@ -27,39 +27,6 @@
       },
       {
         "ordinal": 2,
-        "name": "event_id",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "bets_schema.bets",
-            "name": "event_id"
-          }
-        }
-      },
-      {
-        "ordinal": 3,
-        "name": "selection",
-        "type_info": "Varchar",
-        "origin": {
-          "Table": {
-            "table": "bets_schema.bets",
-            "name": "selection"
-          }
-        }
-      },
-      {
-        "ordinal": 4,
-        "name": "odds_at_placement",
-        "type_info": "Numeric",
-        "origin": {
-          "Table": {
-            "table": "bets_schema.bets",
-            "name": "odds_at_placement"
-          }
-        }
-      },
-      {
-        "ordinal": 5,
         "name": "amount",
         "type_info": "Numeric",
         "origin": {
@@ -70,7 +37,18 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 3,
+        "name": "odds_at_placement",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "odds_at_placement"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "status",
         "type_info": "Varchar",
         "origin": {
@@ -79,22 +57,12 @@
             "name": "status"
           }
         }
-      },
-      {
-        "ordinal": 7,
-        "name": "created_at",
-        "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "bets_schema.bets",
-            "name": "created_at"
-          }
-        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text"
       ]
     },
     "nullable": [
@@ -102,11 +70,8 @@
       false,
       false,
       false,
-      false,
-      false,
-      false,
-      true
+      false
     ]
   },
-  "hash": "5da01459ffeade729cf58bec08411a920f70dfa792b2c00e8918a001518d320b"
+  "hash": "88f603d5664643ddff094fdb95b2ac5ca64bca79dec252a5ed7bf238cbb7a7a4"
 }

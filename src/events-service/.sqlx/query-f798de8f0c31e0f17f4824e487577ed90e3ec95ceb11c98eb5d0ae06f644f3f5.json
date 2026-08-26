@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, status, teams, odds FROM mock_schema.events WHERE id = $1",
+  "query": "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
+            "table": "events_schema.events",
             "name": "id"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
+            "table": "events_schema.events",
             "name": "name"
           }
         }
@@ -31,7 +31,7 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
+            "table": "events_schema.events",
             "name": "description"
           }
         }
@@ -42,30 +42,63 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
+            "table": "events_schema.events",
             "name": "status"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "teams",
-        "type_info": "TextArray",
+        "name": "winning_selection",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
-            "name": "teams"
+            "table": "events_schema.events",
+            "name": "winning_selection"
           }
         }
       },
       {
         "ordinal": 5,
+        "name": "teams",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "teams"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "odds",
         "type_info": "NumericArray",
         "origin": {
           "Table": {
-            "table": "mock_schema.events",
+            "table": "events_schema.events",
             "name": "odds"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "settled_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "settled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "created_at"
           }
         }
       }
@@ -80,9 +113,12 @@
       false,
       false,
       false,
+      true,
       false,
-      false
+      false,
+      true,
+      true
     ]
   },
-  "hash": "ef4f24685c9abfa75d5ed7a763a88222ccb2ba41edd0d860534fd9e7703f8391"
+  "hash": "f798de8f0c31e0f17f4824e487577ed90e3ec95ceb11c98eb5d0ae06f644f3f5"
 }

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE events_schema.events SET status = $1, winning_selection = $2, odds = $3 WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "NumericArray",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f755db42b4ec767d17372c72ec7a06d88c7d320691c13b228d5599a523e65e38"
+}

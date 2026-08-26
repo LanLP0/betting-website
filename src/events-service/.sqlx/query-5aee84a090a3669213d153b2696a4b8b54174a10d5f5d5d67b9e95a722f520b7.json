@@ -1,0 +1,122 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events ORDER BY created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "winning_selection",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "winning_selection"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "teams",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "teams"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "odds",
+        "type_info": "NumericArray",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "odds"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "settled_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "settled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "5aee84a090a3669213d153b2696a4b8b54174a10d5f5d5d67b9e95a722f520b7"
+}

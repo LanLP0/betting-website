@@ -5,25 +5,26 @@ ENV RUSTC_WRAPPER=sccache SCCACHE_DIR=/sccache
 
 FROM base AS planner
 WORKDIR /app/service
-COPY . .
-COPY ../betting-common ../betting-common
+COPY src/betting-common /app/betting-common
+COPY src/notification-service /app/service
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo chef prepare --recipe-path recipe.json
 
-FROM base as builder
+FROM base AS builder
 WORKDIR /app/service
-COPY --from=planner /app/recipe.json recipe.json
+COPY --from=planner /app/service/recipe.json recipe.json
+COPY src/betting-common /app/betting-common
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
-COPY . .
-COPY ../betting-common ../betting-common
+COPY src/notification-service /app/service
+ENV SQLX_OFFLINE=true
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
     cargo build --release --bin notification-service
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/notification-service /usr/local/bin/server
+COPY --from=builder /app/service/target/release/notification-service /usr/local/bin/server
 CMD ["server"]

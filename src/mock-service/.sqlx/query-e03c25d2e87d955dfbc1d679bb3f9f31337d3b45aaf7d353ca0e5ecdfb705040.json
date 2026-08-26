@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, user_id, amount, status, webhook_url, webhook_secret, expire_at FROM mock_schema.deposit_requests WHERE client_secret = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "amount",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "amount"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "webhook_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "webhook_url"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "webhook_secret",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "webhook_secret"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "expire_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.deposit_requests",
+            "name": "expire_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e03c25d2e87d955dfbc1d679bb3f9f31337d3b45aaf7d353ca0e5ecdfb705040"
+}

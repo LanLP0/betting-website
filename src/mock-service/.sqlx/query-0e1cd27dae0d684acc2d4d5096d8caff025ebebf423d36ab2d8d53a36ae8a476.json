@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mock_schema.webhook_deliveries (webhook_secret_id, event_type, payload, status, last_attempt_at) VALUES ((SELECT id FROM mock_schema.webhook_secrets WHERE secret = $1 LIMIT 1), $2, $3, $4, NOW())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Varchar",
+        "Jsonb",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e1cd27dae0d684acc2d4d5096d8caff025ebebf423d36ab2d8d53a36ae8a476"
+}

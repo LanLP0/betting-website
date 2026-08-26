@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status, winning_selection, teams, odds FROM events_schema.events WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "winning_selection",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "winning_selection"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "teams",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "teams"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "odds",
+        "type_info": "NumericArray",
+        "origin": {
+          "Table": {
+            "table": "events_schema.events",
+            "name": "odds"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "d4506daa68bdca1512cfc14d217db90068e0fc452aacfc7a0e54d3a89d9ec871"
+}

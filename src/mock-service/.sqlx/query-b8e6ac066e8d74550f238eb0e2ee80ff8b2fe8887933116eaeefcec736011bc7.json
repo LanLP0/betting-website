@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mock_schema.events SET status = 'settled', winning_selection = $1, settled_at = NOW() WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8e6ac066e8d74550f238eb0e2ee80ff8b2fe8887933116eaeefcec736011bc7"
+}

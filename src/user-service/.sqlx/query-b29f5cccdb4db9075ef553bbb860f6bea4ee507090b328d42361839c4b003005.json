@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, password_hash, role FROM users_schema.users WHERE username = $1",
+  "query": "SELECT id, username, email, role FROM users_schema.users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
   "describe": {
     "columns": [
       {
@@ -27,12 +27,12 @@
       },
       {
         "ordinal": 2,
-        "name": "password_hash",
+        "name": "email",
         "type_info": "Varchar",
         "origin": {
           "Table": {
             "table": "users_schema.users",
-            "name": "password_hash"
+            "name": "email"
           }
         }
       },
@@ -50,7 +50,8 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -60,5 +61,5 @@
       false
     ]
   },
-  "hash": "836e39b1771981221cb9f0de32fba3a8a3bb910707ff6681d657065b67e2dc07"
+  "hash": "b29f5cccdb4db9075ef553bbb860f6bea4ee507090b328d42361839c4b003005"
 }

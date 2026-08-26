@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT amount FROM wallet_schema.transactions WHERE user_id = $1 AND type = 'BET_PLACED' AND reference_id = $2",
+  "query": "SELECT id FROM wallet_schema.transactions WHERE user_id = $1 AND type = 'BET_WON' AND reference_id = $2",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "amount",
-        "type_info": "Numeric",
+        "name": "id",
+        "type_info": "Uuid",
         "origin": {
           "Table": {
             "table": "wallet_schema.transactions",
-            "name": "amount"
+            "name": "id"
           }
         }
       }
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "c71c8aaae8e6d7e8143e5b40e936c9c34682f6fdb82aa6d937bc14df4c65c198"
+  "hash": "0ab7098f47b3fbc963c60e4cb1adef40464a07192d1a2290c21a6c1078bc1cf2"
 }

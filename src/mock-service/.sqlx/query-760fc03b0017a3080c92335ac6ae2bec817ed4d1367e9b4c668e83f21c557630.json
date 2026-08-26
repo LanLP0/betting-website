@@ -6,12 +6,24 @@
       {
         "ordinal": 0,
         "name": "webhook_url",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.webhook_secrets",
+            "name": "webhook_url"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "secret",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "mock_schema.webhook_secrets",
+            "name": "secret"
+          }
+        }
       }
     ],
     "parameters": {

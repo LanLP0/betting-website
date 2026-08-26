@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO mock_schema.events (id, name, description, status, teams, odds) VALUES ($1, $2, 'Simulated Match', 'open', $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "TextArray",
+        "NumericArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "731aa9022694f773cfa55ce08e8aad97278c99ab91f8ae5927564d6bfa7b0b0e"
+}

@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE bets_schema.bets SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING user_id, amount, selection",
+  "query": "SELECT selection, amount FROM bets_schema.bets WHERE event_id = $1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "user_id",
-        "type_info": "Uuid",
+        "name": "selection",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
             "table": "bets_schema.bets",
-            "name": "user_id"
+            "name": "selection"
           }
         }
       },
@@ -24,30 +24,17 @@
             "name": "amount"
           }
         }
-      },
-      {
-        "ordinal": 2,
-        "name": "selection",
-        "type_info": "Varchar",
-        "origin": {
-          "Table": {
-            "table": "bets_schema.bets",
-            "name": "selection"
-          }
-        }
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
         "Uuid"
       ]
     },
     "nullable": [
       false,
-      false,
       false
     ]
   },
-  "hash": "6dc05b40ff8957bff0eac1ae5c01f060e662e318af61a2417c322515c9d4d303"
+  "hash": "580ddc3f53ad7c31f435aa76622d85bad0d92827e08c092e0754c3a3bca24d5b"
 }

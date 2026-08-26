@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE mock_schema.deposit_requests SET status = 'confirmed' WHERE client_secret = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "18dad448b18afa33ba92fe2fd4c77be355d271038fca5901435a7ee352d0d0cc"
+}

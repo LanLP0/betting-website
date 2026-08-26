@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, password_hash, role FROM users_schema.users WHERE username = $1",
+  "query": "\n                UPDATE users_schema.users \n                SET \n                    username = COALESCE($1, username),\n                    email = COALESCE($2, email)\n                WHERE id = $3\n                RETURNING id, username, email, role\n                ",
   "describe": {
     "columns": [
       {
@@ -27,12 +27,12 @@
       },
       {
         "ordinal": 2,
-        "name": "password_hash",
+        "name": "email",
         "type_info": "Varchar",
         "origin": {
           "Table": {
             "table": "users_schema.users",
-            "name": "password_hash"
+            "name": "email"
           }
         }
       },
@@ -50,7 +50,9 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Varchar",
+        "Varchar",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -60,5 +62,5 @@
       false
     ]
   },
-  "hash": "836e39b1771981221cb9f0de32fba3a8a3bb910707ff6681d657065b67e2dc07"
+  "hash": "20118881281a406ea63e76e910788a6c345c199bda38409d04ddc9e5db38ab05"
 }

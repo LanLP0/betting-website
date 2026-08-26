@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT balance, payment_gateway_token FROM wallet_schema.wallets WHERE user_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "balance",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "wallet_schema.wallets",
+            "name": "balance"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "payment_gateway_token",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "wallet_schema.wallets",
+            "name": "payment_gateway_token"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "571c7e73c41deb0d621e75161f63fb4e6c67f69d7cb58f732c83a4db969551c2"
+}
