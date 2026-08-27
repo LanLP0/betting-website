@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT selection, amount FROM bets_schema.bets WHERE event_id = $1",
+  "query": "UPDATE bets_schema.bets SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1 RETURNING user_id, amount, selection",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "selection",
-        "type_info": "Varchar",
+        "name": "user_id",
+        "type_info": "Uuid",
         "origin": {
           "Table": {
             "table": "bets_schema.bets",
-            "name": "selection"
+            "name": "user_id"
           }
         }
       },
@@ -24,6 +24,17 @@
             "name": "amount"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "selection",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "selection"
+          }
+        }
       }
     ],
     "parameters": {
@@ -33,8 +44,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "580ddc3f53ad7c31f435aa76622d85bad0d92827e08c092e0754c3a3bca24d5b"
+  "hash": "71c6e139861c6e3eda6b79081662f25f44279e421a377d033234888159a658bd"
 }

@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status, user_id, amount, odds_at_placement, selection FROM bets_schema.bets WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "amount",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "amount"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "odds_at_placement",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "odds_at_placement"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "selection",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "selection"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "76edaadf082496fc6f01f2e370c81e69a9d99d9d024a8433af775cc272503c04"
+}

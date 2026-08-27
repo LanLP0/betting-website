@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT selection, amount FROM bets_schema.bets WHERE event_id = $1 AND status != 'FAILED' AND status != 'CANCELLED'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "selection",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "selection"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "amount",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "amount"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "6d63ee64ad60d93d3e0b195fd510de497ae44d7c3c20d675154cbd38d6f2bf66"
+}

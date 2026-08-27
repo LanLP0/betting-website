@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events ORDER BY created_at DESC",
+  "query": "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events ORDER BY created_at DESC LIMIT $1 OFFSET $2",
   "describe": {
     "columns": [
       {
@@ -104,7 +104,10 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
     },
     "nullable": [
       false,
@@ -118,5 +121,5 @@
       true
     ]
   },
-  "hash": "5aee84a090a3669213d153b2696a4b8b54174a10d5f5d5d67b9e95a722f520b7"
+  "hash": "0d9ae25d7a568b4288b96d8e76e96da53993380b61a1f34da7fc901d9f5c9e9d"
 }

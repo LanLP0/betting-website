@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, status, teams, odds FROM mock_schema.events",
+  "query": "SELECT id, name, description, status, teams, odds FROM mock_schema.events ORDER BY id LIMIT $1 OFFSET $2",
   "describe": {
     "columns": [
       {
@@ -71,7 +71,10 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
     },
     "nullable": [
       false,
@@ -82,5 +85,5 @@
       false
     ]
   },
-  "hash": "d1f2acfc79ca8eb3cccda0592b4e8d86d00e3a6d976a43a8d6e40b1384b764dc"
+  "hash": "15f1a674a89b1345d58bd2402b9d761324bbf9f043e4412ecd3d1d546fb2b931"
 }

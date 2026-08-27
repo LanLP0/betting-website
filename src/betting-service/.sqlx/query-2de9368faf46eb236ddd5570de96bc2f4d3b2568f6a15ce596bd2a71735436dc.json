@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                UPDATE bets_schema.bets \n                SET \n                    status = CASE \n                        WHEN status = 'CONFIRMED' AND selection = $2 THEN 'WON'\n                        WHEN status = 'CONFIRMED' AND selection != $2 THEN 'LOST'\n                        WHEN status = 'PENDING' AND selection = $2 THEN 'PENDING-WON'\n                        WHEN status = 'PENDING' AND selection != $2 THEN 'PENDING-LOST'\n                        ELSE status \n                    END,\n                    updated_at = NOW()\n                WHERE event_id = $1 \n                AND status IN ('CONFIRMED', 'PENDING')\n                RETURNING id, user_id, amount, odds_at_placement, status\n                ",
+  "query": "\n                UPDATE bets_schema.bets \n                SET \n                    status = CASE \n                        WHEN status = 'CONFIRMED' AND selection = $2 THEN 'WON'\n                        WHEN status = 'CONFIRMED' AND selection != $2 THEN 'LOST'\n                        WHEN status = 'PENDING' AND selection = $2 THEN 'PENDING-WON'\n                        WHEN status = 'PENDING' AND selection != $2 THEN 'PENDING-LOST'\n                        ELSE status \n                    END,\n                    updated_at = NOW()\n                WHERE event_id = $1 \n                AND status IN ('CONFIRMED', 'PENDING')\n                RETURNING id, user_id, amount, odds_at_placement, status, selection\n                ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,17 @@
             "name": "status"
           }
         }
+      },
+      {
+        "ordinal": 5,
+        "name": "selection",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "bets_schema.bets",
+            "name": "selection"
+          }
+        }
       }
     ],
     "parameters": {
@@ -70,8 +81,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "88f603d5664643ddff094fdb95b2ac5ca64bca79dec252a5ed7bf238cbb7a7a4"
+  "hash": "2de9368faf46eb236ddd5570de96bc2f4d3b2568f6a15ce596bd2a71735436dc"
 }
