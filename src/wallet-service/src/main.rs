@@ -317,7 +317,7 @@ async fn handle_bet_won(pool: &PgPool, rmq: &lapin::Channel, event: BetWon) {
         return;
     }
 
-    let amount = match BigDecimal::try_from(event.payout_amount) {
+    let amount = match BigDecimal::from_str(&event.payout_amount_full) {
         Ok(a) => a,
         Err(e) => {
             log::error!(
