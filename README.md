@@ -25,6 +25,6 @@ For a full specification of this project, see [specs.md](specs.md).
 - [x] Argon2 password hashing in user & management service
 - [x] Swarm deployment script cleanup (`deploy-swarm.sh` drops previous stack)
 - [x] Server-wide request tracing (`X-Request-ID` / `X-Trace-ID` propagation)
-- [x] Complete OpenAPI / Swagger UI specs for management service
+- [ ] Complete OpenAPI / Swagger UI specs for management service
 - [ ] Comprehensive unit and integration test suite
 - [ ] Frontend React client (Planned for future phase)
