@@ -145,7 +145,7 @@ async fn add_event(
     body: web::Json<AddEventReq>,
 ) -> impl Responder {
     let auth_user_role = req_get_user_role(&req);
-    if auth_user_role != "admin" {
+    if auth_user_role != Some("admin") {
         return HttpResponse::Forbidden().finish();
     }
 
@@ -250,7 +250,7 @@ async fn delete_event(
     data: web::Data<AppState>,
 ) -> impl Responder {
     let auth_user_role = req_get_user_role(&req);
-    if auth_user_role != "admin" {
+    if auth_user_role != Some("admin") {
         return HttpResponse::Forbidden().finish();
     }
 
@@ -306,7 +306,7 @@ async fn settle_event(
     body: web::Json<SettleEventReq>,
 ) -> impl Responder {
     let auth_user_role = req_get_user_role(&req);
-    if auth_user_role != "admin" {
+    if auth_user_role != Some("admin") {
         return HttpResponse::Forbidden().finish();
     }
 

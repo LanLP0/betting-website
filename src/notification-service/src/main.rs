@@ -63,7 +63,7 @@ async fn get_user_notifications(
     let auth_user_role = req_get_user_role(&req);
 
     // Enforce authorization: only the resource owner or an admin can view user notifications
-    if !req_user_match_id(&req, &target_user_id) && auth_user_role != "admin" {
+    if !req_user_match_id(&req, &target_user_id) && auth_user_role != Some("admin") {
         return HttpResponse::Forbidden().finish();
     }
 
@@ -428,7 +428,10 @@ async fn rmq_notification_consumer(
                     let _ = delivery.ack(BasicAckOptions::default()).await;
                 }
                 Err(e) => {
-                    log::error!("Malformed NotificationPush payload, routing to DLQ: {:?}", e);
+                    log::error!(
+                        "Malformed NotificationPush payload, routing to DLQ: {:?}",
+                        e
+                    );
                     let _ = delivery
                         .nack(BasicNackOptions {
                             requeue: false,

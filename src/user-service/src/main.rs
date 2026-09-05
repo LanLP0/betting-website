@@ -293,7 +293,7 @@ async fn get_user_profile(
     let auth_user_id = req_get_user_id(&req);
 
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
@@ -341,7 +341,7 @@ async fn update_user_profile(
 
     // Strict Authorization check
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
@@ -434,7 +434,7 @@ async fn delete_user(
     let auth_user_id = req_get_user_id(&req);
 
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
@@ -487,7 +487,7 @@ async fn get_all_users(
     data: web::Data<AppState>,
 ) -> impl Responder {
     let auth_user_role = req_get_user_role(&req);
-    if auth_user_role != "admin" {
+    if auth_user_role != Some("admin") {
         return HttpResponse::Forbidden().finish();
     }
 

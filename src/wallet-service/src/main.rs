@@ -495,7 +495,7 @@ async fn get_balance(
 
     // RBAC: User can only inspect their own wallet balance unless admin
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_user_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
@@ -541,7 +541,7 @@ async fn deposit(
     let auth_user_role = req_get_user_role(&req);
 
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_user_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
@@ -609,7 +609,7 @@ async fn register_payment_method(
 
     // RBAC: User can only register payment methods for their own wallet unless admin
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_user_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
@@ -698,7 +698,7 @@ async fn withdraw(
     let auth_user_role = req_get_user_role(&req);
 
     match (auth_user_id, auth_user_role) {
-        (_, "admin") => {}
+        (_, Some("admin")) => {}
         (Some(uid), _) if uid == target_user_id => {}
         (Some(_), _) => return HttpResponse::Forbidden().finish(),
         (None, _) => return HttpResponse::Unauthorized().finish(),
