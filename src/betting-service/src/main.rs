@@ -2,14 +2,14 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middlewar
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
     BetCancelled, BetRequested, BetWon, EventSettled, NotificationPush, WalletStatus, connect_pg,
-    connect_rmq, exchanges, get_odds_for_event, publish_event, publish_event_with_trace,
-    req_get_request_id,
+    connect_rmq, declare_queue_with_dlx, exchanges, get_odds_for_event, publish_event,
+    publish_event_with_trace, req_get_request_id, req_get_user_id, req_get_user_role, setup_dlq,
 };
-use bigdecimal::{FromPrimitive, RoundingMode, ToPrimitive};
+use bigdecimal::{BigDecimal, FromPrimitive, RoundingMode, ToPrimitive};
 use futures_util::stream::StreamExt;
 use lapin::{options::*, types::FieldTable};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, types::BigDecimal};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::env;
 use uuid::Uuid;
@@ -54,7 +54,7 @@ struct EventBetsMetricsResponse {
     bets_by_selection: Vec<SelectionMetrics>,
 }
 
-// Checked
+// Handle wallet lock funds outcome (SUCCESS / FAILED)
 async fn handle_wallet_status(
     pool: &PgPool,
     rmq: &lapin::Channel,
@@ -64,7 +64,7 @@ async fn handle_wallet_status(
     let bet_status = {
         || async {
             sqlx::query!(
-                "SELECT status FROM bets_schema.bets WHERE id = $1",
+                "SELECT status, user_id, amount, odds_at_placement, selection FROM bets_schema.bets WHERE id = $1",
                 event.bet_id
             )
             .fetch_optional(pool)
@@ -75,62 +75,139 @@ async fn handle_wallet_status(
     .when(betting_common::sqlx_retry_when)
     .await;
 
-    if bet_status.is_err() {
-        // TODO push event back into dead letter queue
-        return;
-    }
-
-    let bet_status = bet_status.unwrap();
-
-    if bet_status.is_none() {
-        if event.status == "SUCCESS" {
-            // TODO refund here
+    let bet_row = match bet_status {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            log::warn!(
+                "Received wallet status for non-existent bet_id: {}",
+                event.bet_id
+            );
+            if event.status == "SUCCESS" {
+                // Bet record was missing; issue automatic refund
+                let refund_ev = BetCancelled {
+                    bet_id: event.bet_id,
+                    user_id: Uuid::nil(),
+                };
+                let _ = publish_event(
+                    rmq,
+                    exchanges::BETTING,
+                    "bet.cancel.request_refund",
+                    refund_ev,
+                )
+                .await;
+            }
+            return;
         }
-        return;
-    }
+        Err(e) => {
+            log::error!(
+                "Database failure in handle_wallet_status (bet_id: {}): {:?}",
+                event.bet_id,
+                e
+            );
+            return;
+        }
+    };
 
-    let s = bet_status.unwrap().status;
+    let s = bet_row.status;
     let status = if event.status == "SUCCESS" {
         match s.as_str() {
-            "PENDING-LOST" => "LOST", // When the event is settled before wallet respond
+            "PENDING-LOST" => "LOST",
             "PENDING-WON" => "WON",
             "PENDING" => "CONFIRMED",
-            _ => unreachable!(), // Possible scenario: wallet status event is fired twice (shouldn't happen due to RMQ message acknowledgement)
+            _ => {
+                log::info!("Bet {} already in final state {}", event.bet_id, s);
+                return;
+            }
         }
     } else {
         "FAILED"
     };
 
-    if status == "WON" {
-        // TODO payout here - push bet.won event
+    let update_res = {
+        || async {
+            sqlx::query!(
+                "UPDATE bets_schema.bets SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING user_id, amount, selection",
+                status,
+                event.bet_id
+            )
+            .fetch_optional(pool)
+            .await
+        }
     }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
-    let bet = {|| async {sqlx::query!(
-        "UPDATE bets_schema.bets SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING user_id, amount, selection",
-        status,
-        event.bet_id
-    )
-    .fetch_optional(pool)
-    .await}}.retry(ExponentialBuilder::default().with_jitter()).when(betting_common::sqlx_retry_when).await;
-
-    if let Ok(Some(row)) = bet {
+    if let Ok(Some(row)) = update_res {
         let user_id: Uuid = row.user_id;
         let selection: String = row.selection;
+
         if status == "CONFIRMED" {
             let notif = NotificationPush {
                 user_id,
                 notification_type: "bet_confirmed".into(),
                 title: "Bet Confirmed".into(),
-                payload: serde_json::json!({ "content": [{"type": "text", "text": format!("Your bet on '{}' has been placed successfully.", selection)}], "metadata": {"bet_id": event.bet_id} }),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Your bet on '{}' has been placed successfully.", selection)}],
+                    "metadata": {"bet_id": event.bet_id}
+                }),
             };
             let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
-        } else {
-            // TODO notification
+        } else if status == "FAILED" {
+            let notif = NotificationPush {
+                user_id,
+                notification_type: "bet_failed".into(),
+                title: "Bet Placement Failed".into(),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Your bet on '{}' could not be placed due to insufficient wallet funds.", selection)}],
+                    "metadata": {"bet_id": event.bet_id}
+                }),
+            };
+            let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
+        } else if status == "WON" {
+            // Settle bet payout
+            let amount: BigDecimal = bet_row.amount;
+            let odds: BigDecimal = bet_row.odds_at_placement;
+            let payout = amount * odds;
+            let payout_f = payout
+                .with_scale_round(4, RoundingMode::HalfEven)
+                .to_f64()
+                .unwrap_or(0.0);
+
+            let event_msg = BetWon {
+                bet_id: event.bet_id,
+                user_id,
+                payout_amount: payout_f,
+                payout_amount_full: payout.to_plain_string(),
+            };
+            let _ = publish_event(rmq, exchanges::BETTING, "bet.won", event_msg).await;
+
+            let notif = NotificationPush {
+                user_id,
+                notification_type: "bet_won".into(),
+                title: "Congratulations! You Won!".into(),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Your bet on '{}' won! Payout of ${:.2} is being credited to your wallet.", selection, payout_f)}],
+                    "metadata": {"bet_id": event.bet_id, "payout": payout_f}
+                }),
+            };
+            let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
+        } else if status == "LOST" {
+            let notif = NotificationPush {
+                user_id,
+                notification_type: "bet_lost".into(),
+                title: "Bet Lost".into(),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Your bet on '{}' lost. The amount has been deducted from your wallet.", selection)}],
+                    "metadata": {"bet_id": event.bet_id}
+                }),
+            };
+            let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
         }
     }
 }
 
-// Checked
+// Handle event settlement and cascade payouts / notifications
 async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventSettled) {
     let winning = event.winning_selection.clone();
 
@@ -150,7 +227,7 @@ async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventS
                     updated_at = NOW()
                 WHERE event_id = $1 
                 AND status IN ('CONFIRMED', 'PENDING')
-                RETURNING id, user_id, amount, odds_at_placement, status
+                RETURNING id, user_id, amount, odds_at_placement, status, selection
                 "#,
                 event.event_id,
                 winning
@@ -164,50 +241,97 @@ async fn handle_event_settled(pool: &PgPool, rmq: &lapin::Channel, event: EventS
     .await;
 
     if res.is_err() {
+        log::error!(
+            "Database update failed during handle_event_settled (event_id: {})",
+            event.event_id
+        );
         return;
     }
 
     let updated_bets = res.unwrap();
 
     for bet in updated_bets {
-        if bet.status != "WON" {
-            // TODO notification for LOST
-            continue;
-        }
-
         let bet_id: Uuid = bet.id;
         let user_id: Uuid = bet.user_id;
-        let amount: BigDecimal = bet.amount;
-        let odds: BigDecimal = bet.odds_at_placement;
-        let payout = amount * odds;
+        let selection: String = bet.selection;
 
-        let payout_f = payout
-            .with_scale_round(4, RoundingMode::HalfEven)
-            .to_f64()
-            .unwrap_or(0.0);
+        if bet.status == "WON" {
+            let amount: BigDecimal = bet.amount;
+            let odds: BigDecimal = bet.odds_at_placement;
+            let payout = amount * odds;
 
-        let event_msg = BetWon {
-            bet_id,
-            user_id,
-            payout_amount: payout_f,
-            payout_amount_full: payout.to_plain_string(),
-        };
+            let payout_f = payout
+                .with_scale_round(4, RoundingMode::HalfEven)
+                .to_f64()
+                .unwrap_or(0.0);
 
-        let _ = publish_event(rmq, exchanges::BETTING, "bet.won", event_msg).await;
+            let event_msg = BetWon {
+                bet_id,
+                user_id,
+                payout_amount: payout_f,
+                payout_amount_full: payout.to_plain_string(),
+            };
+
+            let _ = publish_event(rmq, exchanges::BETTING, "bet.won", event_msg).await;
+
+            let notif = NotificationPush {
+                user_id,
+                notification_type: "bet_won".into(),
+                title: "Bet Won!".into(),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Your bet on '{}' won! Payout of ${:.2} has been credited to your wallet.", selection, payout_f)}],
+                    "metadata": {"bet_id": bet_id, "payout": payout_f}
+                }),
+            };
+            let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
+        } else if bet.status == "LOST" || bet.status == "PENDING-LOST" {
+            let notif = NotificationPush {
+                user_id,
+                notification_type: "bet_lost".into(),
+                title: "Bet Outcome Settled".into(),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Match settled. Your bet on '{}' was not successful this time.", selection)}],
+                    "metadata": {"bet_id": bet_id}
+                }),
+            };
+            let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
+        }
     }
 }
 
-// Checked
-async fn handle_bet_cancel_refunded(pool: &PgPool, event: WalletStatus) {
+// Handle bet cancellation refund completion notification
+async fn handle_bet_cancel_refunded(pool: &PgPool, rmq: &lapin::Channel, event: WalletStatus) {
     if event.status == "SUCCESS" {
-        let _ = sqlx::query!(
-            "UPDATE bets_schema.bets SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1",
-            event.bet_id
-        )
-        .execute(pool)
+        let update_res = {
+            || async {
+                sqlx::query!(
+                    "UPDATE bets_schema.bets SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1 RETURNING user_id, amount, selection",
+                    event.bet_id
+                )
+                .fetch_optional(pool)
+                .await
+            }
+        }
+        .retry(ExponentialBuilder::default().with_jitter())
+        .when(betting_common::sqlx_retry_when)
         .await;
 
-        // TODO refund notification
+        if let Ok(Some(row)) = update_res {
+            let user_id: Uuid = row.user_id;
+            let selection: String = row.selection;
+            let amount: f64 = row.amount.to_f64().unwrap_or(0.0);
+
+            let notif = NotificationPush {
+                user_id,
+                notification_type: "bet_cancelled".into(),
+                title: "Bet Cancelled & Refunded".into(),
+                payload: serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Your bet on '{}' was cancelled. ${:.2} has been refunded to your wallet.", selection, amount)}],
+                    "metadata": {"bet_id": event.bet_id, "amount": amount}
+                }),
+            };
+            let _ = publish_event(rmq, exchanges::NOTIFICATION, "notification.push", &notif).await;
+        }
     }
 }
 
@@ -215,7 +339,6 @@ async fn get_health() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
-// Checked
 async fn place_bet(
     req: HttpRequest,
     data: web::Data<AppState>,
@@ -254,17 +377,24 @@ async fn place_bet(
     };
     let bet_id = Uuid::new_v4();
 
-    let query = {|| async {sqlx::query!(
-        "INSERT INTO bets_schema.bets (id, user_id, event_id, selection, odds_at_placement, amount, status) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')",
-        bet_id,
-        user_id,
-        body.event_id,
-        body.selection,
-        BigDecimal::from_f64(odd_val),
-        amount_dec
-    )
-    .execute(&data.db)
-    .await}}.retry(ExponentialBuilder::default().with_jitter()).when(betting_common::sqlx_retry_when).await;
+    let query = {
+        || async {
+            sqlx::query!(
+                "INSERT INTO bets_schema.bets (id, user_id, event_id, selection, odds_at_placement, amount, status) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')",
+                bet_id,
+                user_id,
+                body.event_id,
+                body.selection,
+                BigDecimal::from_f64(odd_val),
+                amount_dec
+            )
+            .execute(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
     if query.is_err() {
         return HttpResponse::InternalServerError().finish();
@@ -287,7 +417,6 @@ async fn place_bet(
     .await
     .is_err()
     {
-        // TODO handle SQL failure via dead letter queue
         let _ = {
             || async {
                 sqlx::query!(
@@ -325,71 +454,106 @@ async fn cancel_bet(
         Err(_) => return HttpResponse::BadRequest().finish(),
     };
 
-    let bet = sqlx::query!(
-        "SELECT status FROM bets_schema.bets WHERE id = $1 AND user_id = $2",
-        bet_id,
-        user_id
-    )
-    .fetch_optional(&data.db)
-    .await;
-
-    if let Ok(Some(b)) = bet {
-        let status: String = b.status;
-        if status == "CONFIRMED" {
-            let _ = sqlx::query!(
-                "UPDATE bets_schema.bets SET status = 'CANCEL_PENDING' WHERE id = $1",
+    let bet = {
+        || async {
+            sqlx::query!(
+                "SELECT user_id, status FROM bets_schema.bets WHERE id = $1",
                 bet_id
             )
-            .execute(&data.db)
-            .await;
-
-            let trace_id = req_get_request_id(&req);
-            let _ = publish_event_with_trace(
-                &data.rmq,
-                exchanges::BETTING,
-                "bet.cancel.request_refund",
-                BetCancelled { user_id, bet_id },
-                &trace_id,
-            )
-            .await;
-
-            return HttpResponse::Ok().json(serde_json::json!({ "status": "CANCEL_PENDING" }));
+            .fetch_optional(&data.db)
+            .await
         }
     }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
-    HttpResponse::BadRequest().body("Bet cannot be cancelled")
+    if bet.is_err() {
+        return HttpResponse::InternalServerError().finish();
+    }
+
+    let bet = bet.unwrap();
+    if bet.is_none() {
+        return HttpResponse::NotFound().body("Bet not found");
+    }
+
+    let b = bet.unwrap();
+    if b.user_id != user_id {
+        return HttpResponse::NotFound().body("Bet not found");
+    }
+
+    if b.status != "CONFIRMED" && !b.status.starts_with("PENDING") {
+        return HttpResponse::BadRequest().body("Bet cannot be cancelled in its current state");
+    }
+
+    let trace_id = req_get_request_id(&req);
+    let event = BetCancelled { bet_id, user_id };
+
+    if publish_event_with_trace(
+        &data.rmq,
+        exchanges::BETTING,
+        "bet.cancel.request_refund",
+        event,
+        &trace_id,
+    )
+    .await
+    .is_err()
+    {
+        return HttpResponse::InternalServerError().body("Failed to process cancellation request");
+    }
+
+    HttpResponse::Accepted().json(serde_json::json!({
+        "bet_id": bet_id,
+        "status": "CANCELLING"
+    }))
 }
 
 async fn get_bets_by_event(path: web::Path<Uuid>, data: web::Data<AppState>) -> impl Responder {
     let event_id = path.into_inner();
 
-    let rows = sqlx::query!(
-        "SELECT selection, amount FROM bets_schema.bets WHERE event_id = $1",
-        event_id
-    )
-    .fetch_all(&data.db)
-    .await
-    .unwrap_or_default();
+    let rows_req = {
+        || async {
+            sqlx::query!(
+                "SELECT selection, amount FROM bets_schema.bets WHERE event_id = $1 AND status != 'FAILED' AND status != 'CANCELLED'",
+                event_id
+            )
+            .fetch_all(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
-    let total_bets = rows.len();
-    let total_volume: f64 = rows.iter().map(|r| r.amount.to_f64().unwrap_or(0.0)).sum();
-
-    let mut selection_map: HashMap<String, (usize, f64)> = HashMap::new();
-    for r in &rows {
-        let amt = r.amount.to_f64().unwrap_or(0.0);
-        let entry = selection_map.entry(r.selection.clone()).or_insert((0, 0.0));
-        entry.0 += 1;
-        entry.1 += amt;
+    if rows_req.is_err() {
+        return HttpResponse::InternalServerError().finish();
     }
 
-    let bets_by_selection: Vec<SelectionMetrics> = selection_map
-        .into_iter()
-        .map(|(selection, (bet_count, volume))| SelectionMetrics {
+    let rows = rows_req.unwrap();
+
+    let mut total_bets = 0;
+    let mut total_volume = 0.0;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut volumes: HashMap<String, f64> = HashMap::new();
+
+    for row in rows {
+        total_bets += 1;
+        let amount_f = row.amount.to_f64().unwrap_or(0.0);
+        total_volume += amount_f;
+
+        *counts.entry(row.selection.clone()).or_insert(0) += 1;
+        *volumes.entry(row.selection).or_insert(0.0) += amount_f;
+    }
+
+    let mut bets_by_selection = Vec::new();
+    for (selection, count) in counts {
+        let volume = volumes.get(&selection).copied().unwrap_or(0.0);
+        bets_by_selection.push(SelectionMetrics {
             selection,
-            bet_count,
+            bet_count: count,
             volume,
-        })
-        .collect();
+        });
+    }
 
     HttpResponse::Ok().json(EventBetsMetricsResponse {
         event_id,
@@ -399,51 +563,55 @@ async fn get_bets_by_event(path: web::Path<Uuid>, data: web::Data<AppState>) -> 
     })
 }
 
+// TODO pagination
 async fn get_user_bets(
     req: HttpRequest,
     path: web::Path<Uuid>,
     data: web::Data<AppState>,
 ) -> impl Responder {
-    let target_user_id = path.into_inner();
-
-    if let Some(h) = req.headers().get("X-User-ID") {
-        if let Ok(id_str) = h.to_str() {
-            if let Ok(uid) = Uuid::parse_str(id_str) {
-                let role = req
-                    .headers()
-                    .get("X-User-Role")
-                    .and_then(|r| r.to_str().ok())
-                    .unwrap_or("");
-                if uid != target_user_id && role != "admin" {
-                    return HttpResponse::Forbidden().finish();
-                }
-            }
-        }
+    let user_id = path.into_inner();
+    let auth_id = req_get_user_id(&req);
+    let auth_role = req_get_user_role(&req);
+    if auth_role.is_none() || auth_id.is_none() {
+        return HttpResponse::Unauthorized().finish();
+    }
+    let auth_role = auth_role.unwrap();
+    let auth_id = auth_id.unwrap();
+    if auth_role != "admin" && auth_id != user_id {
+        return HttpResponse::Forbidden().finish();
     }
 
-    let rows = sqlx::query!(
-        "SELECT id, user_id, event_id, selection, odds_at_placement, amount, status, created_at FROM bets_schema.bets WHERE user_id = $1 ORDER BY created_at DESC",
-        target_user_id
-    )
-    .fetch_all(&data.db)
-    .await
-    .unwrap_or_default();
+    let rows_req = {
+        || async {
+            sqlx::query!(
+                "SELECT id, user_id, event_id, selection, odds_at_placement, amount, status, created_at FROM bets_schema.bets WHERE user_id = $1 ORDER BY created_at DESC",
+                user_id
+            )
+            .fetch_all(&data.db)
+            .await
+        }
+    }
+    .retry(ExponentialBuilder::default().with_jitter())
+    .when(betting_common::sqlx_retry_when)
+    .await;
 
-    let res: Vec<_> = rows
+    if rows_req.is_err() {
+        return HttpResponse::InternalServerError().finish();
+    }
+
+    let rows = rows_req.unwrap();
+
+    let res: Vec<BetResponse> = rows
         .into_iter()
-        .map(|r| {
-            let odds: BigDecimal = r.odds_at_placement;
-            let amt: BigDecimal = r.amount;
-            BetResponse {
-                id: r.id,
-                user_id: r.user_id,
-                event_id: r.event_id,
-                selection: r.selection,
-                odds_at_placement: odds.to_f64().unwrap_or(1.0),
-                amount: amt.to_f64().unwrap_or(0.0),
-                status: r.status,
-                created_at: r.created_at,
-            }
+        .map(|r| BetResponse {
+            id: r.id,
+            user_id: r.user_id,
+            event_id: r.event_id,
+            selection: r.selection,
+            odds_at_placement: r.odds_at_placement.to_f64().unwrap_or(1.0),
+            amount: r.amount.to_f64().unwrap_or(0.0),
+            status: r.status,
+            created_at: r.created_at,
         })
         .collect();
 
@@ -466,31 +634,33 @@ async fn main() -> std::io::Result<()> {
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL required");
     let redis_client = redis::Client::open(redis_url).expect("Failed Redis connection");
 
+    // Declare Exchanges and Dead-Letter Queue
     rmq_chan
         .exchange_declare(
             exchanges::BETTING.into(),
             lapin::ExchangeKind::Topic,
-            ExchangeDeclareOptions::default(),
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
         .unwrap();
 
-    // Consumer 1: Wallet status responses
+    let _ = setup_dlq(&rmq_chan).await;
+
+    // Consumer 1: Wallet status events (funds locked / insufficient)
     let pool_clone = pool.clone();
     let chan_clone = rmq_chan.clone();
     tokio::spawn(async move {
-        let q = chan_clone
-            .queue_declare(
-                "betting_wallet_responses".into(),
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .unwrap();
+        let q = declare_queue_with_dlx(
+            &chan_clone,
+            "betting_wallet_status",
+            "betting.wallet_status_dead_letter",
+        )
+        .await
+        .unwrap();
 
         chan_clone
             .queue_bind(
@@ -525,10 +695,21 @@ async fn main() -> std::io::Result<()> {
 
         while let Some(delivery) = consumer.next().await {
             if let Ok(delivery) = delivery {
-                if let Ok(ev) = serde_json::from_slice::<WalletStatus>(&delivery.data) {
-                    handle_wallet_status(&pool_clone, &chan_clone, ev, &delivery).await;
+                match serde_json::from_slice::<WalletStatus>(&delivery.data) {
+                    Ok(ev) => {
+                        handle_wallet_status(&pool_clone, &chan_clone, ev, &delivery).await;
+                        let _ = delivery.ack(BasicAckOptions::default()).await;
+                    }
+                    Err(e) => {
+                        log::error!("Malformed WalletStatus payload, routing to DLQ: {:?}", e);
+                        let _ = delivery
+                            .nack(BasicNackOptions {
+                                requeue: false,
+                                multiple: false,
+                            })
+                            .await;
+                    }
                 }
-                let _ = delivery.ack(BasicAckOptions::default()).await;
             }
         }
     });
@@ -537,17 +718,13 @@ async fn main() -> std::io::Result<()> {
     let pool_clone2 = pool.clone();
     let chan_clone2 = rmq_chan.clone();
     tokio::spawn(async move {
-        let q = chan_clone2
-            .queue_declare(
-                "betting_event_settled".into(),
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .unwrap();
+        let q = declare_queue_with_dlx(
+            &chan_clone2,
+            "betting_event_settled",
+            "betting.event_settled_dead_letter",
+        )
+        .await
+        .unwrap();
 
         chan_clone2
             .queue_bind(
@@ -572,29 +749,36 @@ async fn main() -> std::io::Result<()> {
 
         while let Some(delivery) = consumer.next().await {
             if let Ok(delivery) = delivery {
-                if let Ok(ev) = serde_json::from_slice::<EventSettled>(&delivery.data) {
-                    handle_event_settled(&pool_clone2, &chan_clone2, ev).await;
+                match serde_json::from_slice::<EventSettled>(&delivery.data) {
+                    Ok(ev) => {
+                        handle_event_settled(&pool_clone2, &chan_clone2, ev).await;
+                        let _ = delivery.ack(BasicAckOptions::default()).await;
+                    }
+                    Err(e) => {
+                        log::error!("Malformed EventSettled payload, routing to DLQ: {:?}", e);
+                        let _ = delivery
+                            .nack(BasicNackOptions {
+                                requeue: false,
+                                multiple: false,
+                            })
+                            .await;
+                    }
                 }
-                let _ = delivery.ack(BasicAckOptions::default()).await;
             }
         }
     });
 
-    // Consumer 3: Bet cancel refunded confirmation (GAP-11)
+    // Consumer 3: Bet cancel refunded confirmation
     let pool_clone3 = pool.clone();
     let chan_clone3 = rmq_chan.clone();
     tokio::spawn(async move {
-        let q = chan_clone3
-            .queue_declare(
-                "betting_refund_responses".into(),
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .unwrap();
+        let q = declare_queue_with_dlx(
+            &chan_clone3,
+            "betting_refund_responses",
+            "betting.refund_dead_letter",
+        )
+        .await
+        .unwrap();
 
         chan_clone3
             .queue_bind(
@@ -619,10 +803,24 @@ async fn main() -> std::io::Result<()> {
 
         while let Some(delivery) = consumer.next().await {
             if let Ok(delivery) = delivery {
-                if let Ok(ev) = serde_json::from_slice::<WalletStatus>(&delivery.data) {
-                    handle_bet_cancel_refunded(&pool_clone3, ev).await;
+                match serde_json::from_slice::<WalletStatus>(&delivery.data) {
+                    Ok(ev) => {
+                        handle_bet_cancel_refunded(&pool_clone3, &chan_clone3, ev).await;
+                        let _ = delivery.ack(BasicAckOptions::default()).await;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Malformed refund confirmation payload, routing to DLQ: {:?}",
+                            e
+                        );
+                        let _ = delivery
+                            .nack(BasicNackOptions {
+                                requeue: false,
+                                multiple: false,
+                            })
+                            .await;
+                    }
                 }
-                let _ = delivery.ack(BasicAckOptions::default()).await;
             }
         }
     });

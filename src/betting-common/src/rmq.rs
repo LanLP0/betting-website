@@ -1,7 +1,7 @@
 use backon::{ExponentialBuilder, Retryable};
 use lapin::{
     BasicProperties, Connection, ConnectionProperties, PublisherConfirm, options::*,
-    types::FieldTable,
+    types::{AMQPValue, FieldTable},
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -12,6 +12,8 @@ pub mod exchanges {
     pub const BETTING: &str = "betting_topic";
     pub const EVENT: &str = "event_topic";
     pub const NOTIFICATION: &str = "notification_topic";
+    pub const DLX: &str = "dlx_topic";
+    pub const DEAD_LETTER_QUEUE: &str = "dead_letter_queue";
 }
 
 pub async fn connect_rmq(url: &str, con_name: &str) -> Result<lapin::Channel, lapin::Error> {
@@ -31,8 +33,76 @@ pub async fn connect_rmq(url: &str, con_name: &str) -> Result<lapin::Channel, la
     Ok(channel)
 }
 
-/// Publish an event to a RMQ `channel`
-/// This function has default retry parameters
+/// Setup centralized Dead-Letter Exchange and Dead-Letter Queue
+pub async fn setup_dlq(channel: &lapin::Channel) -> Result<(), lapin::Error> {
+    // 1. Declare Topic DLX
+    channel
+        .exchange_declare(
+            exchanges::DLX.into(),
+            lapin::ExchangeKind::Topic,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
+    // 2. Declare durable Dead-Letter Queue
+    let dlq = channel
+        .queue_declare(
+            exchanges::DEAD_LETTER_QUEUE.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+
+    // 3. Bind DLQ to DLX with wildcard '#' to capture all unhandled / poisoned messages
+    channel
+        .queue_bind(
+            dlq.name().to_owned(),
+            exchanges::DLX.into(),
+            "#".into(),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Declare a durable queue configured with Dead-Letter Exchange (DLX) routing arguments
+pub async fn declare_queue_with_dlx(
+    channel: &lapin::Channel,
+    queue_name: &str,
+    dlx_routing_key: &str,
+) -> Result<lapin::Queue, lapin::Error> {
+    let mut args = FieldTable::default();
+    args.insert(
+        "x-dead-letter-exchange".into(),
+        AMQPValue::LongString(exchanges::DLX.into()),
+    );
+    args.insert(
+        "x-dead-letter-routing-key".into(),
+        AMQPValue::LongString(dlx_routing_key.into()),
+    );
+
+    channel
+        .queue_declare(
+            queue_name.into(),
+            QueueDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            args,
+        )
+        .await
+}
+
+/// Publish an event to a RMQ `channel` with retry mechanics
 pub async fn publish_event_props(
     channel: &lapin::Channel,
     exchange: &str,

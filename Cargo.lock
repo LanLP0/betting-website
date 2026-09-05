@@ -622,6 +622,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "lapin",
+ "log",
  "redis",
  "serde",
  "serde_json",
@@ -1399,6 +1400,7 @@ dependencies = [
  "lapin",
  "log",
  "redis",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -4206,6 +4208,7 @@ dependencies = [
  "quote",
  "regex",
  "syn 2.0.118",
+ "uuid",
 ]
 
 [[package]]

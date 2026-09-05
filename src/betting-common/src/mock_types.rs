@@ -76,3 +76,10 @@ pub trait PaymentGateway: Send + Sync {
         req: WithdrawRequest,
     ) -> Pin<Box<dyn Future<Output = Result<WithdrawResponse, String>> + Send + 'a>>;
 }
+
+// Event Service
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct EventSubscribeRequest {
+    pub webhook_url: String,
+    pub service_name: String,
+}

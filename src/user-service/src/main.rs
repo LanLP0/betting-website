@@ -5,8 +5,10 @@ use argon2::{
 };
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
-    Claims, UserCreated, connect_pg, connect_rmq, decode_jwt_rs256, encode_jwt_rs256, exchanges,
-    http::req_get_user_id, publish_event_with_trace, req_get_request_id, req_get_user_role,
+    Claims, PaginationQuery, UserCreated, connect_pg, connect_rmq, decode_jwt_rs256,
+    encode_jwt_rs256, exchanges, http::req_get_user_id, publish_event_with_trace,
+    req_get_request_id, req_get_user_role, setup_dlq, validate_email, validate_password,
+    validate_username,
 };
 use chrono::{Duration, Utc};
 use rand_core::OsRng;
@@ -35,12 +37,6 @@ struct LoginReq {
 struct UpdateProfileReq {
     username: Option<String>,
     email: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UserQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,26 +92,16 @@ async fn register(
     let email = req.email.trim();
     let password = &req.password;
 
-    if username.len() < 3
-        || username.len() > 32
-        || !username.chars().all(|c| c.is_alphanumeric() || c == '_')
-    {
-        return HttpResponse::BadRequest()
-            .body("Username must be 3-32 alphanumeric characters or underscores");
+    if let Err(msg) = validate_username(username) {
+        return HttpResponse::BadRequest().body(msg);
     }
 
-    if email.len() < 5
-        || email.len() > 255
-        || !email.contains('@')
-        || !email.contains('.')
-        || email.starts_with('@')
-        || email.ends_with('@')
-    {
-        return HttpResponse::BadRequest().body("Invalid email format");
+    if let Err(msg) = validate_email(email) {
+        return HttpResponse::BadRequest().body(msg);
     }
 
-    if password.len() < 8 || password.len() > 128 {
-        return HttpResponse::BadRequest().body("Password must be between 8 and 128 characters");
+    if let Err(msg) = validate_password(password) {
+        return HttpResponse::BadRequest().body(msg);
     }
 
     let salt = SaltString::generate(&mut OsRng);
@@ -369,24 +355,14 @@ async fn update_user_profile(
     }
 
     if let Some(uname) = new_username {
-        if uname.len() < 3
-            || uname.len() > 32
-            || !uname.chars().all(|c| c.is_alphanumeric() || c == '_')
-        {
-            return HttpResponse::BadRequest()
-                .body("Username must be 3-32 alphanumeric characters or underscores");
+        if let Err(msg) = validate_username(uname) {
+            return HttpResponse::BadRequest().body(msg);
         }
     }
 
     if let Some(em) = new_email {
-        if em.len() < 5
-            || em.len() > 255
-            || !em.contains('@')
-            || !em.contains('.')
-            || em.starts_with('@')
-            || em.ends_with('@')
-        {
-            return HttpResponse::BadRequest().body("Invalid email format");
+        if let Err(msg) = validate_email(em) {
+            return HttpResponse::BadRequest().body(msg);
         }
     }
 
@@ -507,7 +483,7 @@ async fn delete_user(
 /// Admin-only: list all platform users with pagination support
 async fn get_all_users(
     req: HttpRequest,
-    query: web::Query<UserQuery>,
+    query: web::Query<PaginationQuery>,
     data: web::Data<AppState>,
 ) -> impl Responder {
     let auth_user_role = req_get_user_role(&req);
@@ -515,13 +491,13 @@ async fn get_all_users(
         return HttpResponse::Forbidden().finish();
     }
 
-    let limit = query.limit.unwrap_or(50).clamp(1, 100);
-    let offset = query.offset.unwrap_or(0).max(0);
+    let limit = query.get_limit(50, 100);
+    let offset = query.get_offset();
 
     let rows_res = {
         || async {
             sqlx::query!(
-                "SELECT id, username, email, role FROM users_schema.users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                "SELECT id, username, email, role, COUNT(*) OVER() AS total_count FROM users_schema.users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 limit,
                 offset
             )
@@ -535,6 +511,11 @@ async fn get_all_users(
 
     match rows_res {
         Ok(rows) => {
+            let count: i64 = if rows.is_empty() {
+                0
+            } else {
+                rows[0].total_count.unwrap_or(0)
+            };
             let users: Vec<_> = rows
                 .into_iter()
                 .map(|r| UserResponse {
@@ -544,7 +525,7 @@ async fn get_all_users(
                     role: r.role,
                 })
                 .collect();
-            HttpResponse::Ok().json(users)
+            HttpResponse::Ok().json((count, users))
         }
         Err(e) => {
             log::error!("Database error in get_all_users: {:?}", e);
@@ -585,6 +566,8 @@ async fn main() -> std::io::Result<()> {
         )
         .await
         .unwrap();
+
+    let _ = setup_dlq(&rmq_chan).await;
 
     let jwt_private_key_path =
         env::var("JWT_PRIVATE_KEY_FILE").expect("JWT_PRIVATE_KEY_FILE env var required");

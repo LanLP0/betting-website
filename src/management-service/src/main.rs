@@ -1,4 +1,5 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middleware::Logger, web};
+use betting_common::setup_dlq;
 use betting_common::{connect_rmq, exchanges, http::BadRequestResponse, req_get_user_role};
 use clickhouse::Client as ClickhouseClient;
 use clickhouse::Row;
@@ -61,6 +62,8 @@ fn validate_input_event_query(query: &str) -> bool {
 #[utoipa::path(
     get,
     path = "/api/v1/management/health",
+    tag = "Management",
+    summary = "Management Health Check",
     responses(
         (status = 200, description = "Service Healthy")
     )
@@ -69,24 +72,13 @@ async fn get_health() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
-/*
- * ARCHITECTURAL NOTICE: ANALYTICAL METRICS QUERYING & OLAP OFF-LOADING
- *
- * Context & Scenario:
- * ClickHouse serves as the dedicated column-oriented OLAP warehouse, storing historical telemetry,
- * audit traces, and event logs fanned out from RabbitMQ topic exchanges.
- *
- * Performance & Architecture Blueprint:
- * 1. Read Path Isolation:
- *    - Analytical metric queries (`get_metrics`) query ClickHouse directly and never touch
- *      PostgreSQL, completely isolating high-frequency telemetry from transactional financial tables.
- * 2. Columnar Indexing:
- *    - Queries filter by `event_type` and `trace_id` leveraging the MergeTree primary key index
- *      `(timestamp, event_id, event_type)`.
- */
 #[utoipa::path(
     get,
     path = "/api/v1/management/metrics",
+    tag = "Management",
+    summary = "Query ClickHouse Metrics",
+    description = "Admin-only telemetry analysis querying ClickHouse OLAP events log.",
+    security(("BearerAuth" = [])),
     params(
         ("limit" = Option<u64>, Query, description = "Maximum number of metrics to return (default 100, max 1000)"),
         ("event_type" = Option<String>, Query, description = "Filter by RabbitMQ routing key / event type"),
@@ -105,7 +97,7 @@ async fn get_metrics(
     data: web::Data<AppState>,
 ) -> impl Responder {
     let auth_user_role = req_get_user_role(&req);
-    if auth_user_role != "admin" {
+    if auth_user_role != Some("admin") {
         return HttpResponse::Forbidden().finish();
     }
 
@@ -157,150 +149,128 @@ async fn get_metrics(
     HttpResponse::Ok().json(metrics)
 }
 
-/*
- * ARCHITECTURAL NOTICE: CLICKHOUSE HIGH-THROUGHPUT METRIC INGESTION & BATCHING
- *
- * Context & Scenario:
- * Consumes `#` wildcard topics across all internal domain exchanges:
- * `user_topic`, `wallet_topic`, `betting_topic`, `event_topic`, `notification_topic`.
- *
- * ClickHouse Performance Guard:
- * Direct single-row inserts per RabbitMQ message will generate thousands of tiny data parts
- * ("Too many parts in all data parts in table" error in ClickHouse MergeTree).
- *
- * Target Batching Strategy:
- * Messages are buffered and flushed in batches (up to 100 rows or every 500ms timeout)
- * to maintain high write throughput and low I/O overhead.
- */
+// ============================================================================
+// RMQ INGESTION & BATCH CONSUMPTION TO CLICKHOUSE
+// ============================================================================
+
 async fn metrics_rmq_consumer(rmq_chan: lapin::Channel, clickhouse: ClickhouseClient) {
     let q = rmq_chan
         .queue_declare(
-            "metrics_clickhouse_queue".into(),
+            "management_metrics_queue".into(),
             QueueDeclareOptions {
                 durable: true,
                 ..Default::default()
             },
             FieldTable::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
-    if let Ok(q) = q {
-        let topic_exchanges = vec![
-            exchanges::USER,
-            exchanges::WALLET,
-            exchanges::BETTING,
-            exchanges::EVENT,
-            exchanges::NOTIFICATION,
-        ];
+    let exchanges_to_bind = [
+        exchanges::USER,
+        exchanges::WALLET,
+        exchanges::BETTING,
+        exchanges::EVENT,
+        exchanges::NOTIFICATION,
+    ];
 
-        for ex in topic_exchanges {
-            let _ = rmq_chan
-                .queue_bind(
-                    q.name().to_owned(),
-                    ex.into(),
-                    "#".into(),
-                    QueueBindOptions::default(),
-                    FieldTable::default(),
-                )
-                .await;
-        }
-
-        if let Ok(mut consumer) = rmq_chan
-            .basic_consume(
-                q.name().to_owned(),
-                "metrics_consumer".into(),
-                BasicConsumeOptions::default(),
+    for ex in exchanges_to_bind {
+        let _ = rmq_chan
+            .exchange_declare(
+                ex.into(),
+                lapin::ExchangeKind::Topic,
+                ExchangeDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
                 FieldTable::default(),
             )
-            .await
-        {
-            let mut batch_buffer: Vec<(EventMetric, lapin::message::Delivery)> =
-                Vec::with_capacity(100);
-            let mut flush_interval = tokio::time::interval(Duration::from_millis(500));
+            .await;
 
-            loop {
-                tokio::select! {
-                    delivery_opt = consumer.next() => {
-                        match delivery_opt {
-                            Some(Ok(delivery)) => {
-                                let routing_key = delivery.routing_key.as_str().to_string();
-                                let payload_str = String::from_utf8_lossy(&delivery.data).to_string();
-                                let event_id = Uuid::new_v4().to_string();
+        let _ = rmq_chan
+            .queue_bind(
+                q.name().to_owned(),
+                ex.into(),
+                "#".into(),
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await;
+    }
 
-                                // Extract trace_id from headers or correlation_id
-                                let trace_id = delivery
-                                    .properties
-                                    .headers()
-                                    .as_ref()
-                                    .and_then(|h| h.inner().get("x-trace-id"))
-                                    .and_then(|v| match v {
+    let mut consumer = rmq_chan
+        .basic_consume(
+            q.name().to_owned(),
+            "management_metrics_c".into(),
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .unwrap();
+
+    let mut batch: Vec<(EventMetric, lapin::message::Delivery)> = Vec::with_capacity(100);
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            delivery_opt = consumer.next() => {
+                match delivery_opt {
+                    Some(Ok(delivery)) => {
+                        let event_type = delivery.routing_key.as_str().to_string();
+                        let payload_str = String::from_utf8_lossy(&delivery.data).to_string();
+                        let trace_id = delivery
+                            .properties
+                            .correlation_id()
+                            .as_ref()
+                            .map(|s| s.as_str().to_string())
+                            .or_else(|| {
+                                delivery.properties.headers().as_ref().and_then(|h| {
+                                    h.inner().get("x-trace-id").and_then(|v| match v {
                                         lapin::types::AMQPValue::LongString(s) => Some(s.to_string()),
-                                        lapin::types::AMQPValue::ShortString(s) => Some(s.to_string()),
                                         _ => None,
                                     })
-                                    .or_else(|| {
-                                        delivery
-                                            .properties
-                                            .correlation_id()
-                                            .as_ref()
-                                            .map(|c| c.to_string())
-                                    });
+                                })
+                            });
 
-                                let mut val1 = String::new();
-                                let mut val2 = String::new();
-                                let mut val3 = String::new();
+                        let event_id = Uuid::new_v4().to_string();
+                        let now_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
 
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload_str) {
-                                    if let Some(v) = json.get("user_id").or_else(|| json.get("id")) {
-                                        val1 = v.to_string().trim_matches('"').to_string();
-                                    }
-                                    if let Some(v) = json.get("amount").or_else(|| json.get("status")) {
-                                        val2 = v.to_string().trim_matches('"').to_string();
-                                    }
-                                    if let Some(v) = json.get("bet_id").or_else(|| json.get("event_id")) {
-                                        val3 = v.to_string().trim_matches('"').to_string();
-                                    }
-                                }
+                        let metric = EventMetric {
+                            timestamp: Some(now_ts),
+                            event_id,
+                            event_type,
+                            value1: String::new(),
+                            value2: String::new(),
+                            value3: String::new(),
+                            payload: Some(payload_str),
+                            trace_id,
+                        };
 
-                                let row = EventMetric {
-                                    timestamp: None,
-                                    event_id,
-                                    event_type: routing_key,
-                                    value1: val1,
-                                    value2: val2,
-                                    value3: val3,
-                                    payload: Some(payload_str),
-                                    trace_id,
-                                };
-
-                                batch_buffer.push((row, delivery));
-
-                                if batch_buffer.len() >= 100 {
-                                    flush_metric_batch(&clickhouse, &mut batch_buffer).await;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                log::error!("RabbitMQ delivery stream error in metrics consumer: {:?}", e);
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                            }
-                            None => {
-                                log::warn!("Metrics consumer stream terminated.");
-                                break;
-                            }
+                        batch.push((metric, delivery));
+                        if batch.len() >= 100 {
+                            flush_metric_batch(&clickhouse, &mut batch).await;
                         }
                     }
-                    _ = flush_interval.tick() => {
-                        if !batch_buffer.is_empty() {
-                            flush_metric_batch(&clickhouse, &mut batch_buffer).await;
-                        }
+                    Some(Err(e)) => {
+                        log::error!("Consumer error in metrics consumer: {:?}", e);
                     }
+                    None => {
+                        break;
+                    }
+                }
+            }
+            _ = flush_interval.tick() => {
+                if !batch.is_empty() {
+                    flush_metric_batch(&clickhouse, &mut batch).await;
                 }
             }
         }
     }
 }
 
-/// Batch flush metrics buffer to ClickHouse and ACK deliveries
 async fn flush_metric_batch(
     clickhouse: &ClickhouseClient,
     batch: &mut Vec<(EventMetric, lapin::message::Delivery)>,
@@ -316,7 +286,6 @@ async fn flush_metric_batch(
         Ok(ins) => ins,
         Err(e) => {
             log::error!("Failed to initialize ClickHouse inserter: {:?}", e);
-            // ACK to prevent head-of-line blocking on metric logs
             for (_, delivery) in batch.drain(..) {
                 let _ = delivery.ack(BasicAckOptions::default()).await;
             }
@@ -342,13 +311,12 @@ async fn main() -> std::io::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    // let db_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
-    // let pool = connect_pg(&db_url, 5).await.expect("Failed DB connection");
-
     let rmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL required");
     let rmq_chan = connect_rmq(&rmq_url, "management-service")
         .await
         .expect("Failed RMQ connection");
+
+    let _ = setup_dlq(&rmq_chan).await;
 
     let clickhouse_url =
         env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".into());
@@ -360,7 +328,6 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(metrics_rmq_consumer(rmq_chan.clone(), clickhouse.clone()));
 
     let state = web::Data::new(AppState { clickhouse });
-
     let openapi = ApiDoc::openapi();
 
     HttpServer::new(move || {

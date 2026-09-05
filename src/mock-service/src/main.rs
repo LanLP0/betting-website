@@ -1,9 +1,10 @@
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, web};
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
-    DepositRequest, DepositResponse, DepositWebhookResponse, EventOdds, RegisterPaymentInfoRequest,
-    RegisterPaymentInfoResponse, RegisterPaymentInfoWebhookResponse, WithdrawRequest,
-    WithdrawResponse, http::BadRequestResponse,
+    DepositRequest, DepositResponse, DepositWebhookResponse, EventOdds, EventSubscribeRequest,
+    PaginationQuery, RegisterPaymentInfoRequest, RegisterPaymentInfoResponse,
+    RegisterPaymentInfoWebhookResponse, WithdrawRequest, WithdrawResponse,
+    http::BadRequestResponse,
 };
 use bigdecimal::{RoundingMode, ToPrimitive};
 use chrono::Utc;
@@ -70,12 +71,6 @@ struct ConfirmDepositReq {
 #[derive(Deserialize)]
 struct ConfirmRegisterReq {
     client_secret: String,
-}
-
-#[derive(Deserialize)]
-struct EventSubscribeReq {
-    webhook_url: String,
-    service_name: String,
 }
 
 // Checked
@@ -462,16 +457,23 @@ async fn withdraw(data: web::Data<AppState>, body: web::Json<WithdrawRequest>) -
 }
 
 // Checked
-async fn get_events(data: web::Data<AppState>) -> impl Responder {
+async fn get_events(
+    query: web::Query<PaginationQuery>,
+    data: web::Data<AppState>,
+) -> impl Responder {
     if let Some(res) = data.apply_chaos().await {
         return res;
     }
 
-    // TODO pagination
+    let limit = query.get_limit(50, 100);
+    let offset = query.get_offset();
+
     let rows_req = {
         || async {
             sqlx::query!(
-                "SELECT id, name, description, status, teams, odds FROM mock_schema.events"
+                "SELECT id, name, description, status, teams, odds, COUNT(*) OVER() AS total_count FROM mock_schema.events ORDER BY id LIMIT $1 OFFSET $2",
+                limit,
+                offset
             )
             .fetch_all(&data.db)
             .await
@@ -486,7 +488,13 @@ async fn get_events(data: web::Data<AppState>) -> impl Responder {
     }
 
     let rows = rows_req.unwrap();
-    let list: Vec<_> = rows
+    let count: i64 = if rows.is_empty() {
+        0
+    } else {
+        rows[0].total_count.unwrap_or(0)
+    };
+
+    let events: Vec<_> = rows
         .into_iter()
         .map(|r| {
             let id: Uuid = r.id;
@@ -511,7 +519,7 @@ async fn get_events(data: web::Data<AppState>) -> impl Responder {
         })
         .collect();
 
-    HttpResponse::Ok().json(serde_json::json!({ "events": list }))
+    HttpResponse::Ok().json((count, events))
 }
 
 // Checked
@@ -612,7 +620,7 @@ async fn get_event_odds(path: web::Path<Uuid>, data: web::Data<AppState>) -> imp
 // Checked
 async fn subscribe_events(
     data: web::Data<AppState>,
-    body: web::Json<EventSubscribeReq>,
+    body: web::Json<EventSubscribeRequest>,
 ) -> impl Responder {
     if let Some(res) = data.apply_chaos().await {
         return res;

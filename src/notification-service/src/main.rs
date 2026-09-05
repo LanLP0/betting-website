@@ -2,7 +2,8 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middlewar
 use actix_ws::Message;
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
-    NotificationPush, exchanges, http::req_get_user_id, req_get_user_role, req_user_match_id,
+    NotificationPush, declare_queue_with_dlx, exchanges, http::req_get_user_id, req_get_user_role,
+    req_user_match_id, setup_dlq,
 };
 use futures_util::StreamExt;
 use lapin::{options::*, types::FieldTable};
@@ -342,17 +343,13 @@ async fn rmq_notification_consumer(
     rmq_chan: lapin::Channel,
     redis_client: redis::Client,
 ) {
-    let q = rmq_chan
-        .queue_declare(
-            "notification_push_queue".into(),
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await
-        .expect("Failed to declare notification queue");
+    let q = declare_queue_with_dlx(
+        &rmq_chan,
+        "notification_push_queue",
+        "notification.push_dead_letter",
+    )
+    .await
+    .expect("Failed to declare notification queue");
 
     rmq_chan
         .queue_bind(
@@ -380,49 +377,66 @@ async fn rmq_notification_consumer(
 
     while let Some(delivery) = consumer.next().await {
         if let Ok(delivery) = delivery {
-            if let Ok(notif) = serde_json::from_slice::<NotificationPush>(&delivery.data) {
-                // 1. Persist to database with exponential retry
-                let insert_res = {
-                    || async {
-                        sqlx::query!(
-                            "INSERT INTO notification_schema.user_notifications (user_id, notification_type, title, payload) VALUES ($1, $2, $3, $4)",
-                            notif.user_id,
-                            notif.notification_type,
-                            notif.title,
-                            notif.payload
-                        )
-                        .execute(&pool)
-                        .await
+            match serde_json::from_slice::<NotificationPush>(&delivery.data) {
+                Ok(notif) => {
+                    // 1. Persist to database with exponential retry
+                    let insert_res = {
+                        || async {
+                            sqlx::query!(
+                                "INSERT INTO notification_schema.user_notifications (user_id, notification_type, title, payload) VALUES ($1, $2, $3, $4)",
+                                notif.user_id,
+                                notif.notification_type,
+                                notif.title,
+                                notif.payload
+                            )
+                            .execute(&pool)
+                            .await
+                        }
                     }
-                }
-                .retry(ExponentialBuilder::default().with_jitter())
-                .when(betting_common::sqlx_retry_when)
-                .await;
+                    .retry(ExponentialBuilder::default().with_jitter())
+                    .when(betting_common::sqlx_retry_when)
+                    .await;
 
-                if let Err(e) = insert_res {
-                    log::error!(
-                        "Failed to persist notification to DB after retries: {:?}",
-                        e
-                    );
-                    // TODO In a full production system, reject and route to DLQ
-                }
-
-                // 2. Publish to Redis Pub/Sub for active WebSocket sessions across nodes
-                if redis_conn_opt.is_none() {
-                    redis_conn_opt = redis_client.get_multiplexed_async_connection().await.ok();
-                }
-
-                if let Some(ref mut r_conn) = redis_conn_opt {
-                    let channel_name = format!("notifications:{}", notif.user_id);
-                    let notif_json = serde_json::to_string(&notif).unwrap_or_default();
-                    let pub_res: Result<(), _> = r_conn.publish(channel_name, notif_json).await;
-                    if let Err(e) = pub_res {
-                        log::warn!("Redis publish failed, resetting connection: {:?}", e);
-                        redis_conn_opt = None; // Reconnect on next iteration
+                    if let Err(e) = insert_res {
+                        log::error!(
+                            "Failed to persist notification to DB after retries, routing to DLQ: {:?}",
+                            e
+                        );
+                        let _ = delivery
+                            .nack(BasicNackOptions {
+                                requeue: false,
+                                multiple: false,
+                            })
+                            .await;
+                        continue;
                     }
+
+                    // 2. Publish to Redis Pub/Sub for active WebSocket sessions across nodes
+                    if redis_conn_opt.is_none() {
+                        redis_conn_opt = redis_client.get_multiplexed_async_connection().await.ok();
+                    }
+
+                    if let Some(ref mut r_conn) = redis_conn_opt {
+                        let channel_name = format!("notifications:{}", notif.user_id);
+                        let notif_json = serde_json::to_string(&notif).unwrap_or_default();
+                        let pub_res: Result<(), _> = r_conn.publish(channel_name, notif_json).await;
+                        if let Err(e) = pub_res {
+                            log::warn!("Redis publish failed, resetting connection: {:?}", e);
+                            redis_conn_opt = None; // Reconnect on next iteration
+                        }
+                    }
+                    let _ = delivery.ack(BasicAckOptions::default()).await;
+                }
+                Err(e) => {
+                    log::error!("Malformed NotificationPush payload, routing to DLQ: {:?}", e);
+                    let _ = delivery
+                        .nack(BasicNackOptions {
+                            requeue: false,
+                            multiple: false,
+                        })
+                        .await;
                 }
             }
-            let _ = delivery.ack(BasicAckOptions::default()).await;
         }
     }
 }
@@ -446,11 +460,16 @@ async fn main() -> std::io::Result<()> {
         .exchange_declare(
             exchanges::NOTIFICATION.into(),
             lapin::ExchangeKind::Topic,
-            ExchangeDeclareOptions::default(),
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
         .expect("Failed to declare notification exchange");
+
+    let _ = setup_dlq(&rmq_chan).await;
 
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL required");
     let redis_client = redis::Client::open(redis_url).expect("Failed to initialize Redis client");

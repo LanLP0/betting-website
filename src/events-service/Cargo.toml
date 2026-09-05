@@ -18,6 +18,7 @@ lapin = "4.10"
 redis = { version = "1.6", features = ["tokio-comp"] }
 futures-util = "0.3.34"
 backon = "1.6.0"
+reqwest = { version = "0.13", features = ["json"] }
 betting-common = { path = "../betting-common" }
 log = "0.4"
 env_logger = "0.11"

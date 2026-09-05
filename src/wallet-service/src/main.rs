@@ -5,9 +5,9 @@ use betting_common::{
     BetCancelled, BetRequested, BetWon, DepositRequest, DepositResponse, DepositWebhookResponse,
     NotificationPush, PaymentGateway, RegisterPaymentInfoRequest, RegisterPaymentInfoResponse,
     RegisterPaymentInfoWebhookResponse, UserCreated, WalletStatus, WithdrawRequest,
-    WithdrawResponse, connect_pg, connect_rmq, exchanges, publish_event, publish_event_props,
-    publish_event_with_trace, req_get_request_id, req_get_user_id, req_get_user_role,
-    verify_hmac_signature,
+    WithdrawResponse, connect_pg, connect_rmq, declare_queue_with_dlx, exchanges, publish_event,
+    publish_event_props, publish_event_with_trace, req_get_request_id, req_get_user_id,
+    req_get_user_role, setup_dlq, verify_hmac_signature,
 };
 use bigdecimal::ToPrimitive;
 use futures_util::stream::StreamExt;
@@ -1040,11 +1040,16 @@ async fn main() -> std::io::Result<()> {
         .exchange_declare(
             exchanges::WALLET.into(),
             lapin::ExchangeKind::Topic,
-            ExchangeDeclareOptions::default(),
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
         .unwrap();
+
+    let _ = setup_dlq(&rmq_chan).await;
 
     rmq_chan
         .basic_qos(1, BasicQosOptions::default())
@@ -1055,17 +1060,13 @@ async fn main() -> std::io::Result<()> {
     let pool_clone = pool.clone();
     let chan_clone = rmq_chan.clone();
     tokio::spawn(async move {
-        let q1 = chan_clone
-            .queue_declare(
-                "wallet_user_creates".into(),
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .unwrap();
+        let q1 = declare_queue_with_dlx(
+            &chan_clone,
+            "wallet_user_creates",
+            "wallet.user_creates_dead_letter",
+        )
+        .await
+        .unwrap();
         chan_clone
             .queue_bind(
                 q1.name().to_owned(),
@@ -1088,10 +1089,21 @@ async fn main() -> std::io::Result<()> {
 
         while let Some(delivery) = consumer.next().await {
             if let Ok(delivery) = delivery {
-                if let Ok(ev) = serde_json::from_slice::<UserCreated>(&delivery.data) {
-                    handle_user_create_wallet(&pool_clone, ev).await;
+                match serde_json::from_slice::<UserCreated>(&delivery.data) {
+                    Ok(ev) => {
+                        handle_user_create_wallet(&pool_clone, ev).await;
+                        let _ = delivery.ack(BasicAckOptions::default()).await;
+                    }
+                    Err(e) => {
+                        log::error!("Malformed UserCreated payload, routing to DLQ: {:?}", e);
+                        let _ = delivery
+                            .nack(BasicNackOptions {
+                                requeue: false,
+                                multiple: false,
+                            })
+                            .await;
+                    }
                 }
-                let _ = delivery.ack(BasicAckOptions::default()).await;
             }
         }
     });
@@ -1100,17 +1112,13 @@ async fn main() -> std::io::Result<()> {
     let pool_clone2 = pool.clone();
     let chan_clone2 = rmq_chan.clone();
     tokio::spawn(async move {
-        let q = chan_clone2
-            .queue_declare(
-                "wallet_bet_requests".into(),
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .unwrap();
+        let q = declare_queue_with_dlx(
+            &chan_clone2,
+            "wallet_bet_requests",
+            "wallet.bet_requests_dead_letter",
+        )
+        .await
+        .unwrap();
         chan_clone2
             .queue_bind(
                 q.name().to_owned(),
@@ -1155,20 +1163,56 @@ async fn main() -> std::io::Result<()> {
             if let Ok(delivery) = delivery {
                 let routing_key = delivery.routing_key.as_str();
                 if routing_key == "bet.requested" {
-                    if let Ok(ev) = serde_json::from_slice::<BetRequested>(&delivery.data) {
-                        handle_bet_requested(&pool_clone2, &chan_clone2, ev, &delivery).await;
+                    match serde_json::from_slice::<BetRequested>(&delivery.data) {
+                        Ok(ev) => {
+                            handle_bet_requested(&pool_clone2, &chan_clone2, ev, &delivery).await;
+                            let _ = delivery.ack(BasicAckOptions::default()).await;
+                        }
+                        Err(e) => {
+                            log::error!("Malformed BetRequested payload, routing to DLQ: {:?}", e);
+                            let _ = delivery
+                                .nack(BasicNackOptions {
+                                    requeue: false,
+                                    multiple: false,
+                                })
+                                .await;
+                        }
                     }
                 } else if routing_key == "bet.won" {
-                    if let Ok(ev) = serde_json::from_slice::<BetWon>(&delivery.data) {
-                        handle_bet_won(&pool_clone2, &chan_clone2, ev).await;
+                    match serde_json::from_slice::<BetWon>(&delivery.data) {
+                        Ok(ev) => {
+                            handle_bet_won(&pool_clone2, &chan_clone2, ev).await;
+                            let _ = delivery.ack(BasicAckOptions::default()).await;
+                        }
+                        Err(e) => {
+                            log::error!("Malformed BetWon payload, routing to DLQ: {:?}", e);
+                            let _ = delivery
+                                .nack(BasicNackOptions {
+                                    requeue: false,
+                                    multiple: false,
+                                })
+                                .await;
+                        }
                     }
                 } else if routing_key == "bet.cancel.request_refund" {
-                    if let Ok(ev) = serde_json::from_slice::<BetCancelled>(&delivery.data) {
-                        handle_bet_cancel_request_refund(&pool_clone2, &chan_clone2, ev).await;
+                    match serde_json::from_slice::<BetCancelled>(&delivery.data) {
+                        Ok(ev) => {
+                            handle_bet_cancel_request_refund(&pool_clone2, &chan_clone2, ev).await;
+                            let _ = delivery.ack(BasicAckOptions::default()).await;
+                        }
+                        Err(e) => {
+                            log::error!("Malformed BetCancelled payload, routing to DLQ: {:?}", e);
+                            let _ = delivery
+                                .nack(BasicNackOptions {
+                                    requeue: false,
+                                    multiple: false,
+                                })
+                                .await;
+                        }
                     }
+                } else {
+                    let _ = delivery.ack(BasicAckOptions::default()).await;
                 }
-
-                let _ = delivery.ack(BasicAckOptions::default()).await;
             }
         }
     });

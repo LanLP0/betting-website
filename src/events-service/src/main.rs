@@ -1,9 +1,10 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, middleware::Logger, web};
 use backon::{ExponentialBuilder, Retryable};
 use betting_common::{
-    Event, EventOdds, EventSettled, OddsRpcRequest, OddsRpcResponse, connect_pg, connect_rmq,
-    exchanges, get_odds_for_event, http::BadRequestResponse, publish_event_props,
-    publish_event_with_trace, req_get_request_id, req_get_user_role, verify_hmac_signature,
+    Event, EventOdds, EventSettled, EventSubscribeRequest, OddsRpcRequest, OddsRpcResponse,
+    PaginationQuery, connect_pg, connect_rmq, declare_queue_with_dlx, exchanges,
+    get_odds_for_event, http::BadRequestResponse, publish_event_props, publish_event_with_trace,
+    req_get_request_id, req_get_user_role, setup_dlq, verify_hmac_signature,
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use futures_util::stream::StreamExt;
@@ -39,13 +40,20 @@ async fn get_health() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
-// TODO pagination
-// Checked
-async fn get_events(data: web::Data<AppState>) -> impl Responder {
+// Paginated events listing
+async fn get_events(
+    query: web::Query<PaginationQuery>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let limit = query.get_limit(50, 100);
+    let offset = query.get_offset();
+
     let rows_req = {
         || async {
             sqlx::query!(
-                "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at FROM events_schema.events ORDER BY created_at DESC"
+                "SELECT id, name, description, status, winning_selection, teams, odds, settled_at, created_at, COUNT(*) OVER() AS total_count FROM events_schema.events ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                limit,
+                offset
             )
             .fetch_all(&data.db)
             .await
@@ -60,8 +68,13 @@ async fn get_events(data: web::Data<AppState>) -> impl Responder {
     }
 
     let rows = rows_req.unwrap();
+    let count: i64 = if rows.is_empty() {
+        0
+    } else {
+        rows[0].total_count.unwrap_or(0)
+    };
 
-    let res: Vec<_> = rows
+    let events: Vec<_> = rows
         .into_iter()
         .map(|r| Event {
             id: r.id,
@@ -76,10 +89,9 @@ async fn get_events(data: web::Data<AppState>) -> impl Responder {
         })
         .collect();
 
-    HttpResponse::Ok().json(res)
+    HttpResponse::Ok().json((count, events))
 }
 
-// Checked
 async fn get_event(path: web::Path<Uuid>, data: web::Data<AppState>) -> impl Responder {
     let id = path.into_inner();
 
@@ -118,7 +130,6 @@ async fn get_event(path: web::Path<Uuid>, data: web::Data<AppState>) -> impl Res
     }
 }
 
-// Checked
 async fn get_event_odds(path: web::Path<Uuid>, data: web::Data<AppState>) -> impl Responder {
     let id = path.into_inner();
 
@@ -233,13 +244,6 @@ async fn add_event(
     }
 }
 
-/*
- * ARCHITECTURAL NOTICE: EVENT DELETION & CACHE INVALIDATION
- *
- * Context & Scenario:
- * Deletes an event from PostgreSQL, invalidates Redis odds cache, and publishes
- * `event.deleted` to notify connected clients and downstream microservices.
- */
 async fn delete_event(
     req: HttpRequest,
     path: web::Path<Uuid>,
@@ -295,22 +299,6 @@ async fn delete_event(
     }
 }
 
-/*
- * ARCHITECTURAL NOTICE: EVENT SETTLEMENT SAGA ORCHESTRATION & IDEMPOTENCY
- *
- * Context & Scenario:
- * Settle an event and trigger the downstream settlement Saga across Betting and Wallet services.
- *
- * Saga Workflow:
- * 1. Atomically updates the event status to `SETTLED` in `events_schema.events` with `settled_at = NOW()`.
- *    - Guarantees settlement cannot execute twice for an already settled match (`WHERE status != 'SETTLED'`).
- * 2. Updates Redis cache with `SETTLED` status and winning team.
- * 3. Emits `event.settled` over RabbitMQ (`exchanges::EVENT`) with distributed `trace_id`.
- * 4. Consumed by Betting Service:
- *    - Evaluates all `CONFIRMED` and `PENDING` bets for this match.
- *    - Sets winners to `WON` and losers to `LOST`.
- *    - Emits `bet.won` events to Wallet Service to credit user balances.
- */
 async fn settle_event(
     req: HttpRequest,
     path: web::Path<Uuid>,
@@ -328,7 +316,7 @@ async fn settle_event(
         return HttpResponse::BadRequest().body("Winning selection cannot be empty");
     }
 
-    // 1. Verify event exists and validate that winning_selection is among the match teams
+    // 1. Verify event exists and validate that winning_selection is among match teams
     let event_row = {
         || async {
             sqlx::query!(
@@ -449,7 +437,6 @@ async fn settle_event(
     }
 }
 
-// Checked
 async fn events_callback(
     req: HttpRequest,
     data: web::Data<AppState>,
@@ -515,19 +502,10 @@ async fn events_callback(
     HttpResponse::Ok().finish()
 }
 
-// Checked
-// Background RPC responder for internal services querying event odds
+// Background RPC responder for internal services querying event odds (with DLQ integration)
 async fn rpc_odds_consumer(pool: PgPool, rmq: lapin::Channel, redis_client: redis::Client) {
-    let q = rmq
-        .queue_declare(
-            "event_odds_rpc_queue".into(),
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await;
+    let q =
+        declare_queue_with_dlx(&rmq, "event_odds_rpc_queue", "event.odds.rpc_dead_letter").await;
 
     if let Ok(q) = q {
         let _ = rmq
@@ -557,33 +535,47 @@ async fn rpc_odds_consumer(pool: PgPool, rmq: lapin::Channel, redis_client: redi
                 }
 
                 if let Some(Ok(delivery)) = delivery {
-                    if let Ok(req) = serde_json::from_slice::<OddsRpcRequest>(&delivery.data) {
-                        if let (Some(reply_to), Some(corr_id)) = (
-                            delivery.properties.reply_to().as_ref().map(|s| s.as_str()),
-                            delivery.properties.correlation_id().as_ref(),
-                        ) {
-                            let event_odds =
-                                get_odds_for_event(req.event_id, &pool, &redis_client).await;
+                    match serde_json::from_slice::<OddsRpcRequest>(&delivery.data) {
+                        Ok(req) => {
+                            if let (Some(reply_to), Some(corr_id)) = (
+                                delivery.properties.reply_to().as_ref().map(|s| s.as_str()),
+                                delivery.properties.correlation_id().as_ref(),
+                            ) {
+                                let event_odds =
+                                    get_odds_for_event(req.event_id, &pool, &redis_client).await;
 
-                            let response = OddsRpcResponse {
-                                event_id: req.event_id,
-                                success: event_odds.is_some(),
-                                event_odds,
-                            };
+                                let response = OddsRpcResponse {
+                                    event_id: req.event_id,
+                                    success: event_odds.is_some(),
+                                    event_odds,
+                                };
 
-                            let props =
-                                BasicProperties::default().with_correlation_id(corr_id.clone());
-                            let _ = publish_event_props(&rmq, "", reply_to, response, props).await;
+                                let props =
+                                    BasicProperties::default().with_correlation_id(corr_id.clone());
+                                let _ =
+                                    publish_event_props(&rmq, "", reply_to, response, props).await;
+                            }
+                            let _ = delivery.ack(BasicAckOptions::default()).await;
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Corrupted OddsRpcRequest payload, routing to DLQ: {:?}",
+                                e
+                            );
+                            let _ = delivery
+                                .nack(BasicNackOptions {
+                                    requeue: false,
+                                    multiple: false,
+                                })
+                                .await;
                         }
                     }
-                    let _ = delivery.ack(BasicAckOptions::default()).await;
                 } else {
-                    // Failed
-                    if retries > 3 {
-                        panic!("rpc consumer retries exceed max times");
+                    // Consumer stream failure
+                    if retries > 5 {
+                        log::error!("RPC odds consumer retries exceeded maximum limit");
                     }
-
-                    sleep(Duration::from_secs(1 * 3u64.pow(retries))).await;
+                    sleep(Duration::from_secs(1 * 2u64.pow(retries.min(5)))).await;
                     retries += 1;
                 }
             }
@@ -609,15 +601,21 @@ async fn main() -> std::io::Result<()> {
 
     let webhook_secret = env::var("WEBHOOK_SECRET").expect("WEBHOOK_SECRET env var required");
 
+    // Initialize Event Topic Exchange and Dead-Letter Exchange/Queue
     rmq_chan
         .exchange_declare(
             exchanges::EVENT.into(),
             lapin::ExchangeKind::Topic,
-            ExchangeDeclareOptions::default(),
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
             FieldTable::default(),
         )
         .await
         .unwrap();
+
+    let _ = setup_dlq(&rmq_chan).await;
 
     // Spawn internal RPC responder
     tokio::spawn(rpc_odds_consumer(
@@ -625,6 +623,44 @@ async fn main() -> std::io::Result<()> {
         rmq_chan.clone(),
         redis_client.clone(),
     ));
+
+    // Subscribe to mock events supplier on service startup with retry
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let sub_req = EventSubscribeRequest {
+        webhook_url: "http://events-service:8080/api/v1/events/callback".into(),
+        service_name: "events-service".into(),
+    };
+
+    {
+        || async {
+            let res = http_client
+                .post("http://mock-service:8080/mock/api/v1/events/subscribe")
+                .json(&sub_req)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if res.status().is_success() {
+                log::info!("Events-service successfully subscribed to mock events feed.");
+                Ok(())
+            } else {
+                Err(format!(
+                    "Mock subscription returned status: {}",
+                    res.status()
+                ))
+            }
+        }
+    }
+    .retry(
+        ExponentialBuilder::default()
+            .with_max_times(10)
+            .with_jitter(),
+    )
+    .await
+    .unwrap();
 
     let state = web::Data::new(AppState {
         db: pool,
@@ -652,6 +688,4 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
-
-    // TODO subscribe to /mock/api/v1/events/subscribe on startup
 }
